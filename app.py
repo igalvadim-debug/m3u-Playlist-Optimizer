@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-m3uGenius - Gradio Interface
+m3uGenius - Gradio Interface optimized for Hugging Face Spaces
 Графическая оболочка для работы с M3U плейлистами
 """
 import gradio as gr
@@ -16,6 +16,10 @@ from modules.merger import M3UMerger
 
 OUTPUT_DIR = Path("outputs")
 FONT_PATH = Path("ttf/DejaVuSans.ttf")
+
+# Для Hugging Face Spaces используем корректный адрес привязки
+HF_SPACE_URL = os.getenv("SPACE_ID")  # Will be set by Hugging Face
+LOCALHOST = "127.0.0.1"
 
 
 def create_output_folder():
@@ -374,4 +378,11 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(exist_ok=True)
     print("🚀 Запуск m3uGenius...")
-    app.launch(share=False, server_name="127.0.0.1", server_port=7860)
+    
+    # Оптимизация для Hugging Face Spaces
+    if HF_SPACE_URL:
+        # На Hugging Face Spaces запускаем с правильными параметрами
+        app.launch(server_name="0.0.0.0", server_port=7860)
+    else:
+        # Локально используем стандартные настройки
+        app.launch(share=False, server_name="127.0.0.1", server_port=7860)
