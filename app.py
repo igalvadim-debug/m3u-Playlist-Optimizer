@@ -13,6 +13,18 @@ from modules.tester import M3UTester
 from modules.converter import M3UConverter
 from modules.merger import M3UMerger
 
+from gradio_client import utils as gc_utils
+
+_orig_get_type = gc_utils.get_type
+
+def _safe_get_type(schema):
+    # gradio иногда подсовывает сюда True/False вместо dict
+    if isinstance(schema, bool):
+        return "bool"
+    return _orig_get_type(schema)
+
+gc_utils.get_type = _safe_get_type
+
 
 OUTPUT_DIR = Path("outputs")
 FONT_PATH = Path("ttf/DejaVuSans.ttf")
@@ -378,11 +390,6 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(exist_ok=True)
     print("🚀 Запуск m3uGenius...")
-    
-    # Оптимизация для Hugging Face Spaces
-    if HF_SPACE_URL:
-        # На Hugging Face Spaces запускаем с правильными параметрами
-        app.launch(server_name="0.0.0.0", server_port=7860)
-    else:
-        # Локально используем стандартные настройки
-        app.launch(share=False, server_name="127.0.0.1", server_port=7860)
+
+    app.launch()
+
