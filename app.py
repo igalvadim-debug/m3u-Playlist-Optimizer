@@ -2,6 +2,7 @@
 """
 m3uGenius - Gradio Interface optimized for Hugging Face Spaces
 Графическая оболочка для работы с M3U плейлистами
+OPTIMIZED FOR GRADIO 4.44.1
 """
 import gradio as gr
 import os
@@ -17,7 +18,7 @@ from modules.merger import M3UMerger
 OUTPUT_DIR = Path("outputs")
 FONT_PATH = Path("ttf/DejaVuSans.ttf")
 
-# Для Hugging Face Spaces используем корректный адрес привязки
+# Für Hugging Face Spaces verwenden wir korrekten Adressbindung
 HF_SPACE_URL = os.getenv("SPACE_ID")  # Will be set by Hugging Face
 LOCALHOST = "127.0.0.1"
 
@@ -42,7 +43,9 @@ def cleaner_function(files, blocklist_text):
     def log_progress(msg):
         progress_log.append(msg)
     
-    file_paths = [f.name for f in files]
+    # Gradio 4.44.1: files is already a list of file paths (strings)
+    file_paths = files
+    
     result, stats = cleaner.clean_m3u(file_paths, blocklist_text, log_progress)
     
     if result is None:
@@ -78,7 +81,9 @@ def tester_function(files, timeout, workers):
     def log_progress(msg):
         progress_log.append(msg)
     
-    file_paths = [f.name for f in files]
+    # Gradio 4.44.1: files is already a list of file paths (strings)
+    file_paths = files
+    
     result, stats = tester.test_playlists(file_paths, log_progress)
     
     if result is None:
@@ -115,7 +120,9 @@ def converter_function(files):
     def log_progress(msg):
         progress_log.append(msg)
     
-    file_paths = [f.name for f in files]
+    # Gradio 4.44.1: files is already a list of file paths (strings)
+    file_paths = files
+    
     pdf_story, html_content, md_content = converter.convert_to_formats(file_paths, "playlist", log_progress)
     
     pdf_file = output_folder / "playlist.pdf"
@@ -149,13 +156,16 @@ def merger_load_groups(m3u_files, md_file):
         return gr.update(choices=[], value=[]), "Загрузите M3U файлы и MD файл"
     
     try:
-        with open(md_file.name, 'r', encoding='utf-8') as f:
+        # Gradio 4.44.1: md_file is already a string path
+        with open(md_file, 'r', encoding='utf-8') as f:
             md_content = f.read()
         
         merger = M3UMerger()
         md_groups = merger.parse_md_groups(md_content)
         
-        file_paths = [f.name for f in m3u_files]
+        # Gradio 4.44.1: m3u_files is already a list of file paths (strings)
+        file_paths = m3u_files
+        
         url_to_entry = merger.parse_m3u_files(file_paths, md_groups)
         grouped = merger.rebuild_grouped_data(url_to_entry)
         
@@ -178,13 +188,16 @@ def merger_delete_groups(m3u_files, md_file, selected_groups):
         return None, "Не выбраны группы для удаления"
     
     try:
-        with open(md_file.name, 'r', encoding='utf-8') as f:
+        # Gradio 4.44.1: md_file is already a string path
+        with open(md_file, 'r', encoding='utf-8') as f:
             md_content = f.read()
         
         merger = M3UMerger()
         md_groups = merger.parse_md_groups(md_content)
         
-        file_paths = [f.name for f in m3u_files]
+        # Gradio 4.44.1: m3u_files is already a list of file paths (strings)
+        file_paths = m3u_files
+        
         url_to_entry = merger.parse_m3u_files(file_paths, md_groups)
         grouped = merger.rebuild_grouped_data(url_to_entry)
         
@@ -222,13 +235,16 @@ def merger_merge_groups(m3u_files, md_file, target_group, source_groups):
         return None, "Выберите целевую группу и группы для объединения"
     
     try:
-        with open(md_file.name, 'r', encoding='utf-8') as f:
+        # Gradio 4.44.1: md_file is already a string path
+        with open(md_file, 'r', encoding='utf-8') as f:
             md_content = f.read()
         
         merger = M3UMerger()
         md_groups = merger.parse_md_groups(md_content)
         
-        file_paths = [f.name for f in m3u_files]
+        # Gradio 4.44.1: m3u_files is already a list of file paths (strings)
+        file_paths = m3u_files
+        
         url_to_entry = merger.parse_m3u_files(file_paths, md_groups)
         grouped = merger.rebuild_grouped_data(url_to_entry)
         
@@ -282,7 +298,8 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             cleaner_btn.click(
                 cleaner_function,
                 inputs=[cleaner_files, cleaner_blocklist],
-                outputs=[cleaner_output, cleaner_stats]
+                outputs=[cleaner_output, cleaner_stats],
+                api_name="cleaner"
             )
         
         # TAB 2: Tester
@@ -301,7 +318,8 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             tester_btn.click(
                 tester_function,
                 inputs=[tester_files, tester_timeout, tester_workers],
-                outputs=[tester_output, tester_stats]
+                outputs=[tester_output, tester_stats],
+                api_name="tester"
             )
         
         # TAB 3: Converter
@@ -320,7 +338,8 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             converter_btn.click(
                 converter_function,
                 inputs=[converter_files],
-                outputs=[converter_pdf, converter_html, converter_md, converter_stats]
+                outputs=[converter_pdf, converter_html, converter_md, converter_stats],
+                api_name="converter"
             )
         
         # TAB 4: Merger
@@ -359,19 +378,22 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             merger_load_btn.click(
                 update_dropdowns,
                 inputs=[merger_m3u_files, merger_md_file],
-                outputs=[merger_groups, merger_target, merger_sources, merger_load_status]
+                outputs=[merger_groups, merger_target, merger_sources, merger_load_status],
+                api_name="merger_load"
             )
             
             merger_delete_btn.click(
                 merger_delete_groups,
                 inputs=[merger_m3u_files, merger_md_file, merger_groups],
-                outputs=[merger_output, merger_stats]
+                outputs=[merger_output, merger_stats],
+                api_name="merger_delete"
             )
             
             merger_merge_btn.click(
                 merger_merge_groups,
                 inputs=[merger_m3u_files, merger_md_file, merger_target, merger_sources],
-                outputs=[merger_output, merger_stats]
+                outputs=[merger_output, merger_stats],
+                api_name="merger_merge"
             )
 
 
@@ -379,10 +401,8 @@ if __name__ == "__main__":
     OUTPUT_DIR.mkdir(exist_ok=True)
     print("🚀 Запуск m3uGenius...")
     
-    # Оптимизация для Hugging Face Spaces
-    if HF_SPACE_URL:
-        # На Hugging Face Spaces запускаем с правильными параметрами
-        app.launch(server_name="0.0.0.0", server_port=7860)
-    else:
-        # Локально используем стандартные настройки
-        app.launch(share=False, server_name="127.0.0.1", server_port=7860)
+    # Simplified launch for Hugging Face Spaces - let Gradio handle port automatically
+    app.launch(
+        server_name="0.0.0.0",
+        allowed_paths=["."]  # Important for file access in Gradio 4+
+    )
