@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-m3uGenius - Gradio Interface optimized for Hugging Face Spaces
+m3uGenius - Gradio Interface
 Графическая оболочка для работы с M3U плейлистами
-OPTIMIZED FOR GRADIO 4.44.1
 """
 import gradio as gr
 import os
+import queue
+import threading
 from pathlib import Path
 from datetime import datetime
 from reportlab.platypus import SimpleDocTemplate
@@ -13,14 +14,12 @@ from modules.cleaner import M3UCleaner
 from modules.tester import M3UTester
 from modules.converter import M3UConverter
 from modules.merger import M3UMerger
+from modules.llm_filter import LLMFilter, LLM_PORT
+from modules.header import DEFAULT_EPG, apply_header
 
 
 OUTPUT_DIR = Path("outputs")
 FONT_PATH = Path("ttf/DejaVuSans.ttf")
-
-# Für Hugging Face Spaces verwenden wir korrekten Adressbindung
-HF_SPACE_URL = os.getenv("SPACE_ID")  # Will be set by Hugging Face
-LOCALHOST = "127.0.0.1"
 
 
 def create_output_folder():
@@ -31,7 +30,7 @@ def create_output_folder():
     return folder
 
 
-def cleaner_function(files, blocklist_text):
+def cleaner_function(files, blocklist_text, epg_url="", catchup=True):
     """Очистка и объединение M3U файлов"""
     if not files:
         return None, "Ошибка: не выбраны файлы"
@@ -43,14 +42,13 @@ def cleaner_function(files, blocklist_text):
     def log_progress(msg):
         progress_log.append(msg)
     
-    # Gradio 4.44.1: files is already a list of file paths (strings)
-    file_paths = files
-    
+    file_paths = [f.name for f in files]
     result, stats = cleaner.clean_m3u(file_paths, blocklist_text, log_progress)
     
     if result is None:
         return None, f"Ошибка: {stats.get('error', 'Неизвестная ошибка')}"
     
+    result = apply_header(result, epg_url, catchup)
     output_file = output_folder / "cleaned.m3u"
     with open(output_file, 'w', encoding='utf-8') as f:
         f.writelines(result)
@@ -69,7 +67,7 @@ def cleaner_function(files, blocklist_text):
     return str(output_file), stats_text
 
 
-def tester_function(files, timeout, workers):
+def tester_function(files, timeout, workers, epg_url="", catchup=True):
     """Тестирование потоков"""
     if not files:
         return None, "Ошибка: не выбраны файлы"
@@ -81,14 +79,13 @@ def tester_function(files, timeout, workers):
     def log_progress(msg):
         progress_log.append(msg)
     
-    # Gradio 4.44.1: files is already a list of file paths (strings)
-    file_paths = files
-    
+    file_paths = [f.name for f in files]
     result, stats = tester.test_playlists(file_paths, log_progress)
     
     if result is None:
         return None, f"Ошибка: {stats.get('error', 'Неизвестная ошибка')}"
     
+    result = apply_header(result, epg_url, catchup)
     output_file = output_folder / "tested_working.m3u"
     with open(output_file, 'w', encoding='utf-8') as f:
         f.writelines(result)
@@ -120,9 +117,7 @@ def converter_function(files):
     def log_progress(msg):
         progress_log.append(msg)
     
-    # Gradio 4.44.1: files is already a list of file paths (strings)
-    file_paths = files
-    
+    file_paths = [f.name for f in files]
     pdf_story, html_content, md_content = converter.convert_to_formats(file_paths, "playlist", log_progress)
     
     pdf_file = output_folder / "playlist.pdf"
@@ -156,16 +151,13 @@ def merger_load_groups(m3u_files, md_file):
         return gr.update(choices=[], value=[]), "Загрузите M3U файлы и MD файл"
     
     try:
-        # Gradio 4.44.1: md_file is already a string path
-        with open(md_file, 'r', encoding='utf-8') as f:
+        with open(md_file.name, 'r', encoding='utf-8') as f:
             md_content = f.read()
         
         merger = M3UMerger()
         md_groups = merger.parse_md_groups(md_content)
         
-        # Gradio 4.44.1: m3u_files is already a list of file paths (strings)
-        file_paths = m3u_files
-        
+        file_paths = [f.name for f in m3u_files]
         url_to_entry = merger.parse_m3u_files(file_paths, md_groups)
         grouped = merger.rebuild_grouped_data(url_to_entry)
         
@@ -182,22 +174,19 @@ def merger_load_groups(m3u_files, md_file):
         return gr.update(choices=[], value=[]), f"❌ Ошибка: {str(e)}"
 
 
-def merger_delete_groups(m3u_files, md_file, selected_groups):
+def merger_delete_groups(m3u_files, md_file, selected_groups, epg_url="", catchup=True):
     """Удаление выбранных групп"""
     if not selected_groups:
         return None, "Не выбраны группы для удаления"
     
     try:
-        # Gradio 4.44.1: md_file is already a string path
-        with open(md_file, 'r', encoding='utf-8') as f:
+        with open(md_file.name, 'r', encoding='utf-8') as f:
             md_content = f.read()
         
         merger = M3UMerger()
         md_groups = merger.parse_md_groups(md_content)
         
-        # Gradio 4.44.1: m3u_files is already a list of file paths (strings)
-        file_paths = m3u_files
-        
+        file_paths = [f.name for f in m3u_files]
         url_to_entry = merger.parse_m3u_files(file_paths, md_groups)
         grouped = merger.rebuild_grouped_data(url_to_entry)
         
@@ -207,7 +196,7 @@ def merger_delete_groups(m3u_files, md_file, selected_groups):
         output_folder = create_output_folder()
         output_file = output_folder / "merged_deleted.m3u"
         
-        result = merger.write_m3u(grouped)
+        result = apply_header(merger.write_m3u(grouped), epg_url, catchup)
         with open(output_file, 'w', encoding='utf-8') as f:
             f.writelines(result)
         
@@ -229,22 +218,19 @@ def merger_delete_groups(m3u_files, md_file, selected_groups):
 
 
 
-def merger_merge_groups(m3u_files, md_file, target_group, source_groups):
+def merger_merge_groups(m3u_files, md_file, target_group, source_groups, epg_url="", catchup=True):
     """Объединение групп"""
     if not target_group or not source_groups:
         return None, "Выберите целевую группу и группы для объединения"
     
     try:
-        # Gradio 4.44.1: md_file is already a string path
-        with open(md_file, 'r', encoding='utf-8') as f:
+        with open(md_file.name, 'r', encoding='utf-8') as f:
             md_content = f.read()
         
         merger = M3UMerger()
         md_groups = merger.parse_md_groups(md_content)
         
-        # Gradio 4.44.1: m3u_files is already a list of file paths (strings)
-        file_paths = m3u_files
-        
+        file_paths = [f.name for f in m3u_files]
         url_to_entry = merger.parse_m3u_files(file_paths, md_groups)
         grouped = merger.rebuild_grouped_data(url_to_entry)
         
@@ -256,7 +242,7 @@ def merger_merge_groups(m3u_files, md_file, target_group, source_groups):
         output_folder = create_output_folder()
         output_file = output_folder / "merged_combined.m3u"
         
-        result = merger.write_m3u(grouped)
+        result = apply_header(merger.write_m3u(grouped), epg_url, catchup)
         with open(output_file, 'w', encoding='utf-8') as f:
             f.writelines(result)
         
@@ -277,6 +263,97 @@ def merger_merge_groups(m3u_files, md_file, target_group, source_groups):
         return None, f"❌ Ошибка: {str(e)}"
 
 
+def llm_filter_function(files, timeout, ffmpeg_workers, llm_workers, frames, remove_no_frame, epg_url="", catchup=True, progress=gr.Progress()):
+    """FFmpeg-отсев + проверка кадров моделью (удаление заглушек об оплате)"""
+    if not files:
+        yield None, "Ошибка: не выбраны файлы"
+        return
+
+    file_paths = [f.name for f in files]
+    events = queue.Queue()
+    stop_event = threading.Event()
+    holder = {}
+
+    def cb(frac, desc, line=None):
+        events.put(("p", frac, desc, line))
+
+    def worker():
+        try:
+            filt = LLMFilter(
+                ffmpeg_timeout=timeout,
+                ffmpeg_workers=ffmpeg_workers,
+                llm_workers=llm_workers,
+                frames_per_channel=frames,
+                remove_no_frame=remove_no_frame,
+            )
+            holder["result"] = filt.run(file_paths, cb, stop_event)
+        except Exception as e:
+            holder["error"] = str(e)
+        finally:
+            events.put(("done",))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    log_lines = []
+    try:
+        while True:
+            try:
+                ev = events.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if ev[0] == "done":
+                break
+            _, frac, desc, line = ev
+            progress(frac, desc=desc)
+            if line:
+                log_lines.append(line)
+                yield None, "\n".join(log_lines[-200:])
+    finally:
+        stop_event.set()
+
+    if "error" in holder:
+        yield None, "\n".join(log_lines[-200:]) + f"\n\n❌ Ошибка: {holder['error']}"
+        return
+
+    result = holder["result"]
+    stats = result["stats"]
+
+    if stats["interrupted"]:
+        yield None, "\n".join(log_lines[-200:]) + "\n\n⚠️ Прервано, результат не сохранён"
+        return
+
+    if stats["ffmpeg_working"] == 0:
+        yield None, "\n".join(log_lines[-200:]) + "\n\n❌ FFmpeg не нашёл ни одного рабочего потока, файл не сохранён.\nВозможные причины: провайдер временно блокирует запросы (слишком много проверок подряд), нет интернета или загружен не тот файл. Подождите несколько минут и повторите. Если снова 0, уменьшите «Параллельных FFmpeg-проверок» до 5."
+        return
+
+    output_folder = create_output_folder()
+    kept_file = output_folder / "llm_filtered.m3u"
+    removed_file = output_folder / "llm_removed.m3u"
+    with open(kept_file, 'w', encoding='utf-8') as f:
+        f.writelines(apply_header(result["kept_lines"], epg_url, catchup))
+    with open(removed_file, 'w', encoding='utf-8') as f:
+        f.writelines(result["removed_lines"])
+
+    stats_text = f"""✅ LLM-фильтр завершён!
+
+📊 Статистика:
+- Уникальных потоков: {stats['found']} (дубликатов пропущено: {stats['duplicates']})
+- FFmpeg: рабочих {stats['ffmpeg_working']}, мёртвых {stats['ffmpeg_dead']}
+- Проверено моделью: {stats['checked']}
+- Удалено заглушек (оплата, «сервис недоступен» и т. п.): {stats['payment']}
+- Нормальных: {stats['ok']}
+- Кадр не получен: {stats['no_frame']} (удалено из них: {stats['no_frame_removed']})
+- Ошибок модели: {stats['llm_errors']}
+- Осталось в плейлисте: {stats['kept']}
+
+💾 Сохранено:
+- Чистый плейлист: {kept_file}
+- Удалённые (отчёт): {removed_file}
+"""
+    yield [str(kept_file), str(removed_file)], stats_text
+
+
 # Создание Gradio интерфейса
 with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
     gr.Markdown("# 🎯 m3uGenius")
@@ -290,6 +367,8 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
                 with gr.Column():
                     cleaner_files = gr.File(label="M3U файлы", file_count="multiple", file_types=[".m3u", ".m3u8"])
                     cleaner_blocklist = gr.Textbox(label="Блоклист (один домен/URL на строку)", lines=5, placeholder="example.com\nbad-domain.net")
+                    cleaner_epg = gr.Textbox(label="EPG ссылка (url-tvg)", value=DEFAULT_EPG, placeholder="https://.../epg.xml.gz (несколько через запятую; пусто = без EPG)")
+                    cleaner_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
                     cleaner_btn = gr.Button("🚀 Запустить очистку", variant="primary")
                 with gr.Column():
                     cleaner_output = gr.File(label="Результат")
@@ -297,9 +376,8 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             
             cleaner_btn.click(
                 cleaner_function,
-                inputs=[cleaner_files, cleaner_blocklist],
-                outputs=[cleaner_output, cleaner_stats],
-                api_name="cleaner"
+                inputs=[cleaner_files, cleaner_blocklist, cleaner_epg, cleaner_catchup],
+                outputs=[cleaner_output, cleaner_stats]
             )
         
         # TAB 2: Tester
@@ -310,6 +388,8 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
                     tester_files = gr.File(label="M3U файлы", file_count="multiple", file_types=[".m3u", ".m3u8"])
                     tester_timeout = gr.Slider(minimum=3, maximum=20, value=8, step=1, label="Timeout (секунды)")
                     tester_workers = gr.Slider(minimum=5, maximum=50, value=15, step=5, label="Параллельных потоков")
+                    tester_epg = gr.Textbox(label="EPG ссылка (url-tvg)", value=DEFAULT_EPG, placeholder="https://.../epg.xml.gz (несколько через запятую; пусто = без EPG)")
+                    tester_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
                     tester_btn = gr.Button("🚀 Запустить тестирование", variant="primary")
                 with gr.Column():
                     tester_output = gr.File(label="Результат")
@@ -317,9 +397,8 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             
             tester_btn.click(
                 tester_function,
-                inputs=[tester_files, tester_timeout, tester_workers],
-                outputs=[tester_output, tester_stats],
-                api_name="tester"
+                inputs=[tester_files, tester_timeout, tester_workers, tester_epg, tester_catchup],
+                outputs=[tester_output, tester_stats]
             )
         
         # TAB 3: Converter
@@ -338,8 +417,7 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             converter_btn.click(
                 converter_function,
                 inputs=[converter_files],
-                outputs=[converter_pdf, converter_html, converter_md, converter_stats],
-                api_name="converter"
+                outputs=[converter_pdf, converter_html, converter_md, converter_stats]
             )
         
         # TAB 4: Merger
@@ -354,6 +432,9 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
                     merger_load_status = gr.Textbox(label="Статус загрузки", lines=2)
                 
                 with gr.Column():
+                    merger_epg = gr.Textbox(label="EPG ссылка (url-tvg)", value=DEFAULT_EPG, placeholder="https://.../epg.xml.gz (несколько через запятую; пусто = без EPG)")
+                    merger_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
+
                     gr.Markdown("#### Удалить выбранные группы")
                     merger_delete_btn = gr.Button("🗑️ Удалить группы", variant="stop")
                     
@@ -378,31 +459,48 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             merger_load_btn.click(
                 update_dropdowns,
                 inputs=[merger_m3u_files, merger_md_file],
-                outputs=[merger_groups, merger_target, merger_sources, merger_load_status],
-                api_name="merger_load"
+                outputs=[merger_groups, merger_target, merger_sources, merger_load_status]
             )
             
             merger_delete_btn.click(
                 merger_delete_groups,
-                inputs=[merger_m3u_files, merger_md_file, merger_groups],
-                outputs=[merger_output, merger_stats],
-                api_name="merger_delete"
+                inputs=[merger_m3u_files, merger_md_file, merger_groups, merger_epg, merger_catchup],
+                outputs=[merger_output, merger_stats]
             )
             
             merger_merge_btn.click(
                 merger_merge_groups,
-                inputs=[merger_m3u_files, merger_md_file, merger_target, merger_sources],
-                outputs=[merger_output, merger_stats],
-                api_name="merger_merge"
+                inputs=[merger_m3u_files, merger_md_file, merger_target, merger_sources, merger_epg, merger_catchup],
+                outputs=[merger_output, merger_stats]
+            )
+
+        # TAB 5: LLM-Filter
+        with gr.Tab("🤖 LLM-Filter"):
+            gr.Markdown(f"### Удаление каналов-заглушек (Qwen3-VL, llama-server, порт {LLM_PORT})")
+            gr.Markdown("Шаг 1: FFmpeg отсеивает мёртвые потоки. Шаг 2: из рабочих берётся кадр, модель решает — заглушка с текстом (оплата/подписка, «сервис больше недоступен», недоступно в регионе, канал офлайн, ошибка) или нормальная картинка. Заглушки удаляются. Сервер модели запускается и останавливается автоматически.")
+            with gr.Row():
+                with gr.Column():
+                    llm_files = gr.File(label="M3U файлы", file_count="multiple", file_types=[".m3u", ".m3u8"])
+                    llm_timeout = gr.Slider(minimum=3, maximum=20, value=8, step=1, label="Timeout FFmpeg (секунды)")
+                    llm_ffmpeg_workers = gr.Slider(minimum=5, maximum=50, value=15, step=5, label="Параллельных FFmpeg-проверок")
+                    llm_workers = gr.Slider(minimum=1, maximum=4, value=2, step=1, label="Параллельных запросов к модели")
+                    llm_frames = gr.Slider(minimum=1, maximum=6, value=3, step=1, label="Кадров на канал (больше = надёжнее ловит анимированные заглушки, но дольше)")
+                    llm_remove_noframe = gr.Checkbox(label="Удалять каналы, у которых не удалось получить кадр", value=False)
+                    llm_epg = gr.Textbox(label="EPG ссылка (url-tvg)", value=DEFAULT_EPG, placeholder="https://.../epg.xml.gz (несколько через запятую; пусто = без EPG)")
+                    llm_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
+                    llm_btn = gr.Button("🚀 Запустить LLM-фильтр", variant="primary")
+                with gr.Column():
+                    llm_output = gr.File(label="Результат (чистый плейлист + отчёт об удалённых)", file_count="multiple")
+                    llm_stats = gr.Textbox(label="Ход работы / Статистика", lines=18)
+
+            llm_btn.click(
+                llm_filter_function,
+                inputs=[llm_files, llm_timeout, llm_ffmpeg_workers, llm_workers, llm_frames, llm_remove_noframe, llm_epg, llm_catchup],
+                outputs=[llm_output, llm_stats]
             )
 
 
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(exist_ok=True)
     print("🚀 Запуск m3uGenius...")
-    
-    # Simplified launch for Hugging Face Spaces - let Gradio handle port automatically
-    app.launch(
-        server_name="0.0.0.0",
-        allowed_paths=["."]  # Important for file access in Gradio 4+
-    )
+    app.launch(share=False, server_name="127.0.0.1", server_port=7860)
