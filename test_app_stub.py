@@ -3,14 +3,25 @@ import sys, types, tempfile
 from pathlib import Path
 
 class _Dummy:
-    def __init__(self,*a,**k): pass
-    def __getattr__(self,n): return _Dummy()
+    def __init__(self,*a,**k):
+        """Принять и проигнорировать аргументы компонента Gradio."""
+        pass
+    def __getattr__(self,n):
+        """Вернуть заглушку для любого отсутствующего атрибута."""
+        return _Dummy()
     def __call__(self,*a,**k):
+        """Принять вызов компонента или его метода и вернуть новую заглушку."""
         # декоратор .click(...) должен вернуть функцию-обработчик вызываемо — ок
         return _Dummy()
-    def __enter__(self): return self
-    def __exit__(self,*a): return False
-    def __iter__(self): return iter([])
+    def __enter__(self):
+        """Вернуть эту заглушку при входе в контекст компоновки UI."""
+        return self
+    def __exit__(self,*a):
+        """Завершить контекст, не подавляя исключения."""
+        return False
+    def __iter__(self):
+        """Вернуть пустой итератор вместо коллекции компонентов."""
+        return iter([])
 
 gr = types.ModuleType("gradio")
 for name in ["Blocks","Tab","Row","Column","Markdown","File","Textbox","Button","Checkbox",
@@ -24,8 +35,12 @@ if "reportlab" not in sys.modules:
     except ImportError:
         rl = types.ModuleType("reportlab"); pl = types.ModuleType("reportlab.platypus")
         class SimpleDocTemplate:
-            def __init__(self,*a,**k): pass
-            def build(self,*a,**k): pass
+            def __init__(self,*a,**k):
+                """Принять аргументы PDF-документа без его создания."""
+                pass
+            def build(self,*a,**k):
+                """Принять содержимое документа без записи PDF-файла."""
+                pass
         pl.SimpleDocTemplate = SimpleDocTemplate
         sys.modules["reportlab"]=rl; sys.modules["reportlab.platypus"]=pl
 

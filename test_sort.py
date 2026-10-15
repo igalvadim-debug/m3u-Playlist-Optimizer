@@ -61,6 +61,7 @@ for g, n in res["foreign_groups"]:
 # reconstruct per-channel result by parsing output lines
 from modules.m3u_utils import split_extinf
 def names_from_lines(lines):
+    """Сопоставить имена каналов из строк EXTINF с названиями их групп."""
     out = {}
     for ln in lines:
         if ln.startswith("#EXTINF"):

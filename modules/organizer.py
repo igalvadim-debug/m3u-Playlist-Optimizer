@@ -205,6 +205,7 @@ class Organizer:
     # ------------------------------------------------------------------
     @staticmethod
     def _lang_score(e):
+        """Оценить признаки русского языка в name, group и attrs: чем выше, тем вероятнее русский."""
         name, group, attrs = e["name"], e["group"], e["attrs"]
         score = 0
         if _UKR.search(name) or _LATIN_EXT.search(name):
