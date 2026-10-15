@@ -73,7 +73,8 @@ def _top_reasons(dead, top=3):
 
 class LLMFilter:
     def __init__(self, ffmpeg_timeout=8, ffmpeg_workers=15, llm_workers=2,
-                 remove_no_frame=False, frames_per_channel=3):
+                 remove_no_frame=False, frames_per_channel=3, keep_server=False):
+        self.keep_server = bool(keep_server)
         self.ffmpeg_timeout = int(ffmpeg_timeout)
         self.ffmpeg_workers = int(ffmpeg_workers)
         self.llm_workers = max(1, int(llm_workers))
@@ -118,7 +119,8 @@ class LLMFilter:
 
     def start_server(self):
         if self._server_ready():
-            self._own_server = False
+            if self._proc is None:
+                self._own_server = False
             self._emit(0.5, "Сервер модели уже запущен", f"🤖 llama-server уже работает на порту {LLM_PORT}, использую его")
             return
 
@@ -271,6 +273,24 @@ class LLMFilter:
             data = json.loads(r.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"].strip()
 
+    def ask_text(self, prompt, max_tokens=120):
+        """Текстовый запрос к модели (без картинки). Возвращает ответ строкой."""
+        payload = {
+            "model": "qwen3-vl",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": int(max_tokens),
+            "stream": False,
+        }
+        req = urllib.request.Request(
+            f"http://{LLM_HOST}:{LLM_PORT}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"].strip()
+
     @staticmethod
     def is_payment(answer):
         up = answer.upper()
@@ -293,7 +313,7 @@ class LLMFilter:
             "ffmpeg_working": 0, "ffmpeg_dead": 0,
             "checked": 0, "payment": 0, "ok": 0,
             "no_frame": 0, "no_frame_removed": 0, "llm_errors": 0,
-            "kept": 0, "interrupted": False,
+            "kept": 0, "interrupted": False, "bad_audio": 0,
         }
 
         # ---------------- Шаг 1: FFmpeg ----------------
@@ -387,6 +407,13 @@ class LLMFilter:
                            "❌ Проба не нашла ни одного рабочего потока, повтор не нужен")
 
         working.sort(key=lambda s: s["idx"])
+
+        # Отделяем каналы с неподдерживаемым аудио (MP2/MP1): в LLM не идут, в отдельный файл
+        self._bad_audio = [s for s in working if s.get("audio") in M3UTester.BAD_AUDIO]
+        if self._bad_audio:
+            working = [s for s in working if s.get("audio") not in M3UTester.BAD_AUDIO]
+            self._emit(0.5, "FFmpeg: аудио", f"🔇 Без звука (MP2/MP1): {len(self._bad_audio)} — в отдельный файл")
+        stats["bad_audio"] = len(self._bad_audio)
         kept, removed = [], []
 
         if stats["interrupted"]:
@@ -477,13 +504,15 @@ class LLMFilter:
                     kept.append(stream)
 
         finally:
-            self.stop_server()
+            if not self.keep_server:
+                self.stop_server()
 
         self._emit(1.0, "Готово", "✅ Готово")
         return self._build(kept, removed, stats)
 
     # ------------------------------------------------------------------
     def _build(self, kept, removed, stats):
+        bad_audio = getattr(self, '_bad_audio', [])
         stats["kept"] = len(kept)
         now = datetime.now().isoformat()
 
@@ -502,4 +531,12 @@ class LLMFilter:
             removed_lines.append(f"{s['info']}\n")
             removed_lines.append(f"{s['url']}\n")
 
-        return {"kept_lines": kept_lines, "removed_lines": removed_lines, "stats": stats}
+        bad_audio_lines = ["#EXTM3U\n",
+                           f"# Каналы без звука в приложении (MP2/MP1) — {now}\n",
+                           f"# Таких каналов: {len(bad_audio)}\n\n"]
+        for s in bad_audio:
+            bad_audio_lines.append(f"{s['info']}\n")
+            bad_audio_lines.append(f"{s['url']}\n")
+
+        return {"kept_lines": kept_lines, "removed_lines": removed_lines, "kept_streams": kept,
+                "bad_audio_lines": bad_audio_lines, "stats": stats}

@@ -8,10 +8,17 @@ M3U Header Module
 DEFAULT_EPG = "https://www.open-epg.com/files/russia3.xml.gz"
 
 
-def build_header(epg_url="", catchup=True):
+def split_epg(epg_url=""):
+    """Список ссылок EPG из строки (разделители: запятая, пробел, перевод строки)."""
+    urls = [u.strip().replace('"', '') for u in (epg_url or "").replace("\n", ",").replace(" ", ",").split(",")]
+    return [u for u in urls if u]
+
+
+def build_header(epg_url="", catchup=True, single=False):
     """
     Собирает строку заголовка, например:
     #EXTM3U catchup="append" catchup-source="?utc=${start}" url-tvg="https://..."
+    single=True: в шапку попадает только первая ссылка EPG.
     Возвращает None, если ни EPG, ни catchup не нужны.
     """
     parts = ["#EXTM3U"]
@@ -19,9 +26,9 @@ def build_header(epg_url="", catchup=True):
         parts.append('catchup="append"')
         parts.append('catchup-source="?utc=${start}"')
 
-    # Можно указать несколько ссылок через запятую или пробел
-    urls = [u.strip().replace('"', '') for u in (epg_url or "").replace("\n", ",").replace(" ", ",").split(",")]
-    urls = [u for u in urls if u]
+    urls = split_epg(epg_url)
+    if single:
+        urls = urls[:1]
     if urls:
         parts.append('url-tvg="' + ",".join(urls) + '"')
 
@@ -30,12 +37,12 @@ def build_header(epg_url="", catchup=True):
     return " ".join(parts) + "\n"
 
 
-def apply_header(lines, epg_url="", catchup=True):
+def apply_header(lines, epg_url="", catchup=True, single=False):
     """
     Ставит заголовок первой строкой списка lines (старые #EXTM3U убираются).
     Если EPG пустая и catchup выключен, строки возвращаются без изменений.
     """
-    header = build_header(epg_url, catchup)
+    header = build_header(epg_url, catchup, single)
     if header is None:
         return lines
     rest = [ln for ln in lines if not ln.strip().startswith("#EXTM3U")]

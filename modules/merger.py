@@ -1,105 +1,130 @@
 #!/usr/bin/env python3
 """
 M3U Merger Module
-Умное объединение M3U файлов по группам с чекбоксами
+Склейка плейлистов с отсевом одинаковых адресов потоков и правка групп в одном окне.
+Группы берутся прямо из group-title плейлистов (playlist.md больше не нужен).
+Состояние (state) — обычный dict, его хранит gr.State в интерфейсе.
 """
-import re
 from pathlib import Path
-from collections import defaultdict
+
+from modules.header import split_epg
+from modules.m3u_utils import parse_m3u, url_key, entry_to_lines
+
+NO_GROUP = "Без группы"
+HISTORY_LIMIT = 20
 
 
 class M3UMerger:
-    def __init__(self):
-        pass
-    
-    def parse_md_groups(self, md_content):
-        """Парсит группы из Markdown контента"""
-        group_to_channels = defaultdict(set)
-        current_group = None
-        for line in md_content.split('\n'):
-            line = line.strip()
-            if line.startswith('### 🔹'):
-                group_raw = line[6:].strip()
-                group_clean = re.sub(r'^[\U0001F300-\U0001F9FF]+', '', group_raw).strip()
-                current_group = group_clean
-            elif line.startswith('- ') and current_group:
-                channel_name = line[2:].strip()
-                if channel_name:
-                    group_to_channels[current_group].add(channel_name)
-        return dict(group_to_channels)
-    
-    def is_radio(self, channel_name, group_name=""):
-        radio_keywords = {'radio', 'радио', 'fm', 'am', 'smooth', 'jazz', 'music', 'музыка', '📻'}
-        combined = (channel_name + " " + group_name).lower()
-        return any(kw in combined for kw in radio_keywords)
-    
-    def parse_m3u_files(self, m3u_files, md_groups, progress_callback=None):
-        """Парсит M3U файлы и группирует по MD"""
-        url_to_entry = {}
-        channel_to_group = {}
-        for group, channels in md_groups.items():
-            for ch in channels:
-                channel_to_group[ch] = group
-        
-        for m3u_file in m3u_files:
-            if progress_callback:
-                progress_callback(f"Парсинг: {Path(m3u_file).name}")
-            
-            with open(m3u_file, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
-            
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                if line.startswith('#EXTINF:'):
-                    parts = line.rsplit(',', 1)
-                    channel_name = parts[1].strip() if len(parts) == 2 else "(без имени)"
-                    if i + 1 < len(lines):
-                        url = lines[i + 1].strip()
-                        if url and not url.startswith('#') and url.startswith(('http://', 'https://')):
-                            if self.is_radio(channel_name):
-                                i += 2
-                                continue
-                            final_group = channel_to_group.get(channel_name, "Без группы")
-                            if url not in url_to_entry:
-                                url_to_entry[url] = (channel_name, final_group)
-                    i += 2
-                else:
-                    i += 1
-        
-        return url_to_entry
-    
-    def rebuild_grouped_data(self, url_to_entry):
-        """Восстанавливает группировку"""
-        grouped = defaultdict(list)
-        for url, (name, group) in url_to_entry.items():
-            grouped[group].append((name, url))
-        return grouped
-    
-    def get_group_list(self, grouped):
-        """Возвращает список групп для чекбоксов"""
-        return sorted(grouped.keys())
-    
-    def merge_groups(self, grouped, target_group, source_groups):
-        """Объединяет группы"""
-        for src_group in source_groups:
-            if src_group != target_group and src_group in grouped:
-                grouped[target_group].extend(grouped[src_group])
-                del grouped[src_group]
-        return grouped
-    
-    def delete_groups(self, grouped, groups_to_delete):
-        """Удаляет группы"""
-        for group in groups_to_delete:
-            if group in grouped:
-                del grouped[group]
-        return grouped
-    
-    def write_m3u(self, grouped_data):
-        """Записывает M3U контент"""
+    # ------------------------------------------------------------------
+    # Загрузка и склейка
+    # ------------------------------------------------------------------
+    @staticmethod
+    def new_state():
+        return {"groups": {}, "epg": [], "history": [], "files": []}
+
+    def load(self, paths, ignore_query=False, log=None):
+        """
+        Склеивает плейлисты по порядку. Если адрес потока уже встречался,
+        вторая и последующие копии пропускаются. EPG берётся из первого файла, где она есть.
+        Возвращает (state, stats).
+        """
+        state = self.new_state()
+        seen = set()
+        stats = {"files": 0, "total": 0, "duplicates": 0, "kept": 0, "errors": []}
+
+        for path in paths:
+            name = Path(path).name
+            try:
+                epg, entries = parse_m3u(path)
+            except Exception as e:
+                stats["errors"].append(f"{name}: {e}")
+                continue
+            stats["files"] += 1
+            state["files"].append(name)
+            if log:
+                log(f"📂 {name}: каналов {len(entries)}")
+            if epg and not state["epg"]:
+                state["epg"] = epg[:1]  # только первая ссылка первого плейлиста, где она есть
+
+            for e in entries:
+                stats["total"] += 1
+                key = url_key(e["url"], ignore_query)
+                if key in seen:
+                    stats["duplicates"] += 1
+                    continue
+                seen.add(key)
+                group = e["group"] or NO_GROUP
+                state["groups"].setdefault(group, []).append(e)
+                stats["kept"] += 1
+        return state, stats
+
+    # ------------------------------------------------------------------
+    # Группы
+    # ------------------------------------------------------------------
+    @staticmethod
+    def labels(state):
+        """Подписи для чекбоксов: 'Группа (N каналов)'."""
+        return [f"{g} ({len(v)} каналов)" for g, v in state["groups"].items()]
+
+    @staticmethod
+    def names_from_labels(labels):
+        return [l.rsplit(" (", 1)[0] for l in (labels or [])]
+
+    @staticmethod
+    def total(state):
+        return sum(len(v) for v in state["groups"].values())
+
+    @staticmethod
+    def _push_history(state):
+        state["history"].append({g: list(v) for g, v in state["groups"].items()})
+        if len(state["history"]) > HISTORY_LIMIT:
+            state["history"].pop(0)
+
+    def delete_groups(self, state, names):
+        names = [n for n in names if n in state["groups"]]
+        if not names:
+            return 0
+        self._push_history(state)
+        removed = 0
+        for n in names:
+            removed += len(state["groups"].pop(n))
+        return removed
+
+    def merge_groups(self, state, target, sources):
+        """Переносит каналы из sources в target (target может быть новым именем)."""
+        target = (target or "").strip()
+        sources = [s for s in sources if s in state["groups"] and s != target]
+        if not target or not sources:
+            return 0
+        self._push_history(state)
+        moved = 0
+        dest = state["groups"].setdefault(target, [])
+        for s in sources:
+            items = state["groups"].pop(s)
+            dest.extend(items)
+            moved += len(items)
+        return moved
+
+    def undo(self, state):
+        if not state["history"]:
+            return False
+        state["groups"] = state["history"].pop()
+        return True
+
+    # ------------------------------------------------------------------
+    # Сохранение
+    # ------------------------------------------------------------------
+    def write_lines(self, state):
         lines = ["#EXTM3U\n"]
-        for group in sorted(grouped_data.keys()):
-            for channel_name, url in grouped_data[group]:
-                lines.append(f'#EXTINF:-1 group-title="{group}",{channel_name}\n')
-                lines.append(f'{url}\n')
+        for group, entries in state["groups"].items():
+            for e in entries:
+                lines.extend(entry_to_lines(e, group))
         return lines
+
+    @staticmethod
+    def pick_epg(state, epg_field=""):
+        """Одна ссылка EPG: из поля, если заполнено, иначе из первого плейлиста."""
+        urls = split_epg(epg_field)
+        if urls:
+            return urls[0]
+        return state["epg"][0] if state["epg"] else ""
