@@ -112,6 +112,14 @@ _FOREIGN_GROUP = re.compile(r"\b(germany|deutsch|german|france|french|italy|ital
 _QUALITY = re.compile(r"\b(hd|fhd|uhd|4k|sd|hevc|orig|оригинал)\b|\(.*?\)|\[.*?\]", re.I)
 _RU_LANG = re.compile(r"\b(ru|rus|russian)\b|русск", re.I)
 _RU_COUNTRY = {"ru", "rus", "russia", "россия", "рф"}
+# известные русскоязычные каналы, записанные латиницей (EUROPA PLUS, RU.TV и т. п.)
+_RU_BRANDS = re.compile(
+    r"europa\s?plus|\bru[ ._-]?tv\b|shanson|radika|record\s?(tv|dance)\b|russkij|rossijsk|"
+    r"\bren\b|match!?\s?(tv|arena|football|boets|fighting|igra|premier|planeta|live)?\b|"
+    r"karusel|lubimoe|lyubimoe|\bnashe\b|otvet\b|zvezda|domashni|pyatnica|piatnica|subbota|"
+    r"perec\b|\btnt\b|\bsts\b|muz\s?tv|tvcentr|obshchestvo|moste?\b|"
+    r"(discovery|nat\s?geo|history|animal\s?planet|via?sat|paramount|cartoon|nick(elodeon)?)"
+    r"\s?\b(russia|rus|ru|hd\s?ru)\b", re.I)
 
 
 def _norm(name):
@@ -197,6 +205,7 @@ class Organizer:
     # ------------------------------------------------------------------
     @staticmethod
     def _lang_score(e):
+        """Оценить признаки русского языка в name, group и attrs: чем выше, тем вероятнее русский."""
         name, group, attrs = e["name"], e["group"], e["attrs"]
         score = 0
         if _UKR.search(name) or _LATIN_EXT.search(name):
@@ -206,7 +215,7 @@ class Organizer:
         has_cyr_name = bool(_CYR.search(name))
         if has_cyr_name:
             score += 2
-        if _RU_LATIN.search(name):
+        if _RU_LATIN.search(name) or _RU_BRANDS.search(name):
             score += 2
         lang = (attrs.get("tvg-language") or "").lower()
         if lang:
