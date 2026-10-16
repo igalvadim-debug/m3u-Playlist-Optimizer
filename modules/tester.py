@@ -179,17 +179,15 @@ class M3UTester:
                 'tested_at': datetime.now().isoformat()
             }
     
-    def test_playlists(self, m3u_files, progress_callback=None, chunk_size=280, save_dir=None):
+    def test_playlists(self, m3u_files, progress_callback=None, chunk_size=280):
         """
         Тестирование списка плейлистов кусками (по ~chunk_size каналов, всегда < 300).
 
-        Перед фильтрацией создаётся временная папка с проверенными каналами
-        (название: день недели + дата), список нарезается на куски, каждый кусок
-        прогоняется по очереди, результат сохраняется в этой папке, а в конце
-        всё объединяется в один выходной список.
-
-        save_dir — куда складывать файлы кусков (по умолчанию outputs/Проверенные_...).
-        Возвращает (output_lines, stats); self.save_dir — папка проверенных каналов.
+        Список нарезается на куски, каждый кусок прогоняется по очереди.
+        Сохранением результатов занимается вызывающий код: возвращает
+        (output_lines, stats, chunks) — объединённый список рабочих каналов,
+        статистику и списки протестированных потоков по кускам (каждый поток
+        содержит 'result' с итогом проверки).
         """
         all_streams = []
 
@@ -203,14 +201,7 @@ class M3UTester:
             self.stats['total_streams_found'] += len(streams)
 
         if not all_streams:
-            return None, {"error": "Нет потоков для тестирования"}
-
-        # Временная папка с проверенными каналами: название = день, дата, время
-        if save_dir is None:
-            save_dir = Path("outputs") / datetime.now().strftime("Проверенные_%A_%d.%m.%Y_%H-%M-%S")
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        self.save_dir = save_dir
+            return None, {"error": "Нет потоков для тестирования"}, []
 
         # Нарезаем список на куски меньше 300 каналов
         chunk_size = max(1, min(int(chunk_size), 299))
@@ -219,8 +210,7 @@ class M3UTester:
         if progress_callback:
             progress_callback(
                 f"🔍 Найдено {len(all_streams)} уникальных потоков. "
-                f"Делю на {len(chunks)} кусок(ов) по ≤{chunk_size} и прогоняю по очереди...\n"
-                f"📁 Папка проверенных каналов: {save_dir}")
+                f"Делю на {len(chunks)} кусок(ов) по ≤{chunk_size} и прогоняю по очереди...")
 
         tested_count = 0
         total = len(all_streams)
@@ -262,12 +252,9 @@ class M3UTester:
                                 f"Рабочих: {self.stats['streams_working']}"
                             )
 
-                # Результат куска — в папку с проверенными каналами
-                chunk_file = save_dir / f"chunk_{ci:03d}.m3u"
-                self._write_chunk(chunk_file, chunk)
-
+                # Результат куска остаётся в self.chunks (сохраняет вызывающий код)
                 if progress_callback:
-                    progress_callback(f"💾 Кусок {ci}/{len(chunks)} сохранён: {chunk_file.name}")
+                    progress_callback(f"🧩 Кусок {ci}/{len(chunks)} проверен")
 
         except KeyboardInterrupt:
             if progress_callback:
@@ -280,7 +267,7 @@ class M3UTester:
         output_lines.append(f"# Всего протестировано: {self.stats['streams_tested']}\n")
         output_lines.append(f"# Рабочих потоков: {len(self.working_streams)}\n")
         output_lines.append(f"# Дубликатов удалено: {self.stats['streams_duplicate']}\n")
-        output_lines.append(f"# Кусков прогнано: {len(chunks)}, папка проверенных: {save_dir}\n")
+        output_lines.append(f"# Кусков прогнано: {len(chunks)}\n")
         output_lines.append("#" + "="*60 + "\n\n")
 
         # Сортируем по исходному файлу
@@ -296,7 +283,7 @@ class M3UTester:
             output_lines.append(f"{stream['info']}\n")
             output_lines.append(f"{stream['url']}\n")
 
-        return output_lines, self.stats
+        return output_lines, self.stats, chunks
 
     @staticmethod
     def _write_chunk(path, chunk):

@@ -162,12 +162,11 @@ li[data-testid="dropdown-option"] { cursor: help; }
         });
         wrap.addEventListener('mousemove', function (e) {
             if (el.style.display !== 'block') return;
-            const r = host.getBoundingClientRect();
+            // .epg-tooltip позиционируется как position:fixed -> только координаты вьюпорта
             const w = el.offsetWidth, h = el.offsetHeight;
-            const left = Math.min(Math.max(-r.left + 8, e.clientX - r.left + 14),
-                                  window.innerWidth - r.left - w - 8);
-            let top = e.clientY - r.top + 18;
-            if (top + h > window.innerHeight - r.top - 8) top = Math.max(-r.top + 8, e.clientY - r.top - h - 12);
+            const left = Math.min(Math.max(8, e.clientX + 14), window.innerWidth - w - 8);
+            let top = e.clientY + 18;
+            if (top + h > window.innerHeight - 8) top = Math.max(8, e.clientY - h - 12);
             el.style.left = left + 'px';
             el.style.top = top + 'px';
         });
@@ -240,11 +239,15 @@ def tester_function(files, timeout, workers, epg_choice=None, epg_custom="", cat
         progress_log.append(msg)
 
     file_paths = [f.name for f in files]
-    result, stats = tester.test_playlists(file_paths, log_progress,
-                                          chunk_size=CHUNK_SIZE, save_dir=verified_folder)
+    result, stats, chunks = tester.test_playlists(file_paths, log_progress,
+                                                  chunk_size=CHUNK_SIZE)
 
     if result is None:
         return None, f"Ошибка: {stats.get('error', 'Неизвестная ошибка')}"
+
+    # сохранение результатов кусков в папку проверенных каналов (как раньше)
+    for ci, chunk in enumerate(chunks, start=1):
+        tester._write_chunk(verified_folder / f"chunk_{ci:03d}.m3u", chunk)
 
     result = apply_header(result, epg_url, catchup)
     output_file = output_folder / "tested_working.m3u"
@@ -374,11 +377,14 @@ def _group_by_topics(streams):
         e = {"attrs": attrs, "name": name or "",
              "group": (attrs.get("group-title") or "").strip()}
         cat = Organizer._rule_category(e)
-        if cat == "other":
+        if cat is None or cat == "other":
+            # нет совпадения по правилам -> резервная группа из исходного group-title
             g = e["group"] or "Разное"
-        else:
+        elif cat in CATS:
             emoji, title, _, _ = CATS[cat]
             g = f"{emoji} {title}"
+        else:
+            g = e["group"] or "Разное"
         groups_map.setdefault(g, []).append(s)
     ordered = sorted(groups_map.items(), key=lambda kv: kv[0])
     lines = ["#EXTM3U\n"]
@@ -427,10 +433,9 @@ def run_pipeline(files, epg_choice, epg_custom, catchup=True, do_test=False, tim
                 if do_test:
                     # FFmpeg-проверка только этого куска, по очереди
                     tester = M3UTester(timeout=timeout, max_workers=workers)
-                    res, st = tester.test_playlists([_chunk_to_tmpfile(verified_folder, ci, chunk)],
-                                                    lambda m: cb(base, f"Кусок {ci}/{total_chunks}", m),
-                                                    chunk_size=len(chunk) + 1,
-                                                    save_dir=Path(verified_folder) / f"_test_{ci:03d}")
+                    res, st, _ = tester.test_playlists([_chunk_to_tmpfile(verified_folder, ci, chunk)],
+                                                       lambda m: cb(base, f"Кусок {ci}/{total_chunks}", m),
+                                                       chunk_size=len(chunk) + 1)
                     if res is None:
                         kept = list(chunk)
                     else:
