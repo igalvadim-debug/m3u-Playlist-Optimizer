@@ -9,6 +9,7 @@ M3U LLM-Filter Module
 """
 import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -24,18 +25,22 @@ from pathlib import Path
 
 from modules.tester import M3UTester
 
+logger = logging.getLogger("m3ugenius.llm_filter")
+
 
 # ---------------------------------------------------------------------------
-# Настройки
+# Настройки (переопределяются переменными окружения)
 # ---------------------------------------------------------------------------
-LLM_HOST = "127.0.0.1"
-LLM_PORT = 7845
+LLM_HOST = os.environ.get("M3UGENIUS_LLM_HOST", "127.0.0.1")
+LLM_PORT = int(os.environ.get("M3UGENIUS_LLM_PORT", "7845"))
 
-SERVER_EXE = Path(r"D:\Unsloth\C-claude\llama.cpp\llama-server.exe")
-MODEL_PATH = Path(r"C:\ai_diffusion\models\LLM\Qwen3-VL-4B-Instruct-abliterated.Q8_0.gguf")
-MMPROJ_PATH = Path(r"C:\ai_diffusion\models\LLM\mmproj-F16.gguf")
+SERVER_EXE = Path(os.environ.get("M3UGENIUS_LLAMA_SERVER", r"D:\Unsloth\C-claude\llama.cpp\llama-server.exe"))
+MODEL_PATH = Path(os.environ.get(
+    "M3UGENIUS_MODEL_PATH", r"C:\ai_diffusion\models\LLM\Qwen3-VL-4B-Instruct-abliterated.Q8_0.gguf"))
+MMPROJ_PATH = Path(os.environ.get(
+    "M3UGENIUS_MMPROJ_PATH", r"C:\ai_diffusion\models\LLM\mmproj-F16.gguf"))
 
-SERVER_LOG = Path("outputs") / "llama_server_7845.log"
+SERVER_LOG = Path(os.environ.get("M3UGENIUS_OUTPUT_DIR", "outputs")) / "llama_server_7845.log"
 SERVER_START_TIMEOUT = 240  # секунд на загрузку модели
 FRAME_STEP = 1.5  # интервал между кадрами одного канала, секунды (заглушки-анимации меняются во времени)
 

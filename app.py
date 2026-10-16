@@ -21,8 +21,9 @@ from modules.m3u_utils import parse_m3u, url_key, set_group
 from modules.organizer import Organizer
 
 
-OUTPUT_DIR = Path("outputs")
+OUTPUT_DIR = Path(os.environ.get("M3UGENIUS_OUTPUT_DIR", "outputs"))
 FONT_PATH = Path("ttf/DejaVuSans.ttf")
+SERVER_PORT = int(os.environ.get("M3UGENIUS_PORT", "7860"))
 
 
 def create_output_folder():
@@ -646,5 +647,5 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
 
 if __name__ == "__main__":
     OUTPUT_DIR.mkdir(exist_ok=True)
-    print("🚀 Запуск m3uGenius...")
-    app.launch(share=False, server_name="127.0.0.1", server_port=7865)
+    print(f"🚀 Запуск m3uGenius на http://127.0.0.1:{SERVER_PORT} ...")
+    app.launch(share=False, server_name="127.0.0.1", server_port=SERVER_PORT)

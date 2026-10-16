@@ -10,12 +10,105 @@ EPG Builder
 Всё делается потоково: большие файлы (сотни МБ / ГБ после разжатия) не грузятся в память.
 """
 import gzip
+import http.client
 import io
+import ipaddress
 import re
+import socket
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
 SUFFIXES = ("fullhd", "fhd", "uhd", "4k", "hd", "sd")
+MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024  # потолок на скачанный ответ, защита от OOM/зловредных серверов
+
+
+def _safe_socket_connect(host, port=None, timeout=None, source_address=None):
+    """socket.create_connection с проверкой: запрещённые адреса (SSRF-guard, в т. ч. DNS-rebinding)."""
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if not infos:
+        raise OSError(f"Cannot determine address of {host!r}")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise ValueError(f"EPG-источник указывает на запрещённый адрес: {ip}")
+    family, stype, proto, _, addr = infos[0]
+    sock = socket.socket(family, stype, proto)
+    if timeout is not None:
+        sock.settimeout(timeout)
+    if source_address:
+        sock.bind(source_address)
+    try:
+        sock.connect(addr)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+class _SafeHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        old = socket.create_connection
+        socket.create_connection = _safe_socket_connect
+        try:
+            super().connect()
+        finally:
+            socket.create_connection = old
+
+
+class _SafeHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        old = socket.create_connection
+        socket.create_connection = _safe_socket_connect
+        try:
+            super().connect()
+        finally:
+            socket.create_connection = old
+
+
+class _SafeHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_SafeHTTPConnection, req)
+
+
+class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_SafeHTTPSConnection, req)
+
+
+_opener = urllib.request.build_opener(_SafeHTTPHandler(), _SafeHTTPSHandler())
+
+
+def validate_epg_url(url):
+    """Проверяет, что ссылка безопасна для скачивания. Возвращает причину отказа или None."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "некорректный URL"
+    if parsed.scheme not in ("http", "https"):
+        return f"схема '{parsed.scheme}' запрещена (только http/https)"
+    host = parsed.hostname
+    if not host:
+        return "в URL нет хоста"
+    try:
+        # если хост — это IP, проверяем сразу; иначе резолвим и проверяем все адреса
+        try:
+            ips = [ipaddress.ip_address(host)]
+        except ValueError:
+            try:
+                infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80),
+                                           0, socket.SOCK_STREAM)
+            except socket.gaierror:
+                return f"не удалось разрешить хост '{host}'"
+            ips = [ipaddress.ip_address(i[4][0]) for i in infos]
+        if not ips:
+            return f"хост '{host}' не имеет адресов"
+        for ip in ips:
+            if not ip.is_global:
+                return f"хост '{host}' указывает на запрещённый адрес {ip} (локальная сеть/loopback)"
+    except ValueError as e:
+        return str(e)
+    return None
 
 
 def norm(name):
@@ -61,6 +154,24 @@ def add_tvgid(line, tvg_id):
         rest = re.sub(r'tvg-id="[^"]*"', 'tvg-id="%s"' % tvg_id, rest, count=1)
         return "#EXTINF:" + dur + rest
     return "#EXTINF:" + dur + ' tvg-id="%s"' % tvg_id + rest
+
+
+class _LimitedRead:
+    """File-like обёртка: отдаёт не более limit байт, дальше — пустой поток (защита от OOM)."""
+
+    def __init__(self, stream, limit):
+        self._s = stream
+        self._left = int(limit)
+
+    def read(self, n=-1):
+        if self._left <= 0:
+            return b""
+        if n is None or n < 0:
+            data = self._s.read(self._left)
+        else:
+            data = self._s.read(min(n, self._left))
+        self._left -= len(data)
+        return data
 
 
 class _Prepend:
@@ -121,11 +232,13 @@ class EpgBuilder:
     @staticmethod
     def _open_stream(url, timeout=300):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (m3uGenius)"})
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        head = resp.read(2)
+        resp = _opener.open(req, timeout=timeout)  # SSRF-guard: соединение только с публичными IP
+        # Потолковый лимит объёма скачивания (защита от «бесконечного» ответа / OOM)
+        stream = _LimitedRead(resp, MAX_DOWNLOAD_BYTES)
+        head = stream.read(2)
         if head == b"\x1f\x8b":
-            return gzip.GzipFile(fileobj=_Prepend(head, resp))
-        return _Prepend(head, resp)
+            return gzip.GzipFile(fileobj=_Prepend(head, stream))
+        return _Prepend(head, stream)
 
     # ---------- фильтрация ----------
     def _filter_into(self, stream, want_norm, name2id, out):
@@ -178,6 +291,11 @@ class EpgBuilder:
         out.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<tv>\n')
         for i, u in enumerate(urls):
             self.stats["sources"] += 1
+            reason = validate_epg_url(u)
+            if reason:
+                self.stats["errors"].append(f"{u}: {reason}")
+                log(f"  \u2717 пропущен небезопасный источник [{i + 1}/{len(urls)}] {u}: {reason}")
+                continue
             log(f"Скачиваю/разбираю EPG [{i + 1}/{len(urls)}]: {u}")
             try:
                 stream = self._open_stream(u)

@@ -98,9 +98,25 @@ _UKR = re.compile(r"[ІіЇїЄєҐґЎўӘәҒғҚқҢңӨөҰұҮүҺһ]")
 # латиница с диакритикой (ä ö ü ß é ñ ...): точно не русский канал
 _LATIN_EXT = re.compile(r"[\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff\u0100-\u017f]")
 # явные признаки другой страны или языка в названии или группе
-_NONRU_NAME = re.compile(r"deutsch|german|\bard\b|\bzdf\b|\brtl\b|sat\.?1|pro ?7\b|kabel ?eins|\borf\b|\bsrf\b|3sat|"
-                         r"tagesschau|qazaq|kazakh|kazakstan|казах|қазақ|немецк|германи|украин|ukrain|турецк|turk|"
-                         r"польск|polish|англий|english|француз|french|итальянск|italian|испанск|spanish", re.I)
+_NONRU_NAME = re.compile(
+    r"deutsch|german|\bard\b|\bzdf\b|\brtl\b|sat\.?1|pro ?7\b|kabel ?eins|\borf\b|\bsrf\b|3sat|"
+    r"tagesschau|super(?:rtl)?\b|sixx\b|tele[ -]?(5|berlin|club|de)\b|\bpuls\b|\bdaserste\b|"
+    r"servus ?tv|joyn\b|\bwdr\b|\bnr?[d]w?\b|\bn-tv\b|arte|\bsky\b|\bdhl\b|\bbundesliga\b|\bzero\b|"
+    # немецкие слова/топики в названиях и группах (с границами слов)
+    r"\bhobby\b|\btier\b|\bheimatkino\b|\bvolksmusik\b|\bschlager\b|\bnachrichten\b|\bwetter\b|"
+    r"\breportage\b|\bdoku(?:mentation)?\b|\bserien\b|\bfilme\b|"
+    r"qazaq|kazakh|kazakstan|казах|қазақ|немецк|германи|украин|ukrain|турецк|turk|"
+    r"польск|polish|англий|english|француз|french|итальянск|italian|испанск|spanish", re.I)
+# чисто немецкие каналы, определяемые по точному совпадению имени (после нормализации)
+_DE_NAMES = {
+    "das erste", "zdf", "zdfneo", "3sat", "kika", "phoenix", "rtl", "rtll", "rtl2", "rtlup",
+    "sat1", "pro7", "prosieben", "kabel1", "kabeleins", "sixx", "tele5", "superrtl",
+    "vox", "n-tv", "ntv", "welt", "hr", "mdr", "ndr", "rbb", "swr", "wdr", "br", "arte",
+    "servustv", "puls4", "atv", "orf1", "orf2", "joyn", "maxdome", "sportal", "sport1",
+    "dazn", "einsplus", "one", "zdfkultur", "zdfinfo", "zendern", "nickde", "disneyde",
+}
+# tvg-id с немецким/австрийским суффиксом без точки: zdf_de, orf_at ...
+_TVGID_UNDER_CC = re.compile(r"[_.-](de|at|ch)[_.-]?$")
 # суффикс страны в tvg-id (ZDF.de, Khabar.kz)
 _TVGID_CC = re.compile(r"\.(ru|de|at|ch|kz|ua|uk|gb|us|fr|it|es|tr|pl|pt|nl|be|az|am|ge|uz|lv|lt|ee|md|il|ae|sa|eg|in|cn|jp|kr|br|mx|ca|au)(?:@\w+)?$")
 _RU_LATIN = re.compile(r"russia|rossiya|russian|match ?tv|ren ?tv|pyatnitsa|zvezda|karusel|domashniy|muz-?tv|"
@@ -212,6 +228,9 @@ class Organizer:
             return -4
         if _NONRU_NAME.search(name) or (group and _NONRU_NAME.search(group)):
             return -4
+        # точное совпадение с известным немецким каналом (после снятия HD/SD и скобок)
+        if _norm(name) in _DE_NAMES:
+            return -4
         has_cyr_name = bool(_CYR.search(name))
         if has_cyr_name:
             score += 2
@@ -220,9 +239,12 @@ class Organizer:
         lang = (attrs.get("tvg-language") or "").lower()
         if lang:
             score += 3 if _RU_LANG.search(lang) else -3
-        m = _TVGID_CC.search((attrs.get("tvg-id") or "").lower().strip())
+        tvg_id = (attrs.get("tvg-id") or "").lower().strip()
+        m = _TVGID_CC.search(tvg_id)
         if m:
             score += 2 if m.group(1) == "ru" else -3
+        elif _TVGID_UNDER_CC.search(tvg_id):
+            score -= 3
         country = (attrs.get("tvg-country") or "").lower().strip()
         if country:
             score += 2 if country in _RU_COUNTRY else -1
@@ -254,15 +276,29 @@ class Organizer:
 
             def make_prompt(chunk):
                 lines = "\n".join(f"{i}. {t}" for i, (_, t) in enumerate(chunk, 1))
-                return ("You classify TV channels by BROADCAST LANGUAGE. Answer RU only if the channel broadcasts "
-                        "mainly in Russian: Russian TV channels and Russian-language feeds (e.g. 'Discovery Russia'). "
-                        "Answer OTHER for everything else: German, Kazakh, Ukrainian, Belarusian-language, English, "
-                        "Turkish, Polish, Arabic etc., and for international channels without an explicit Russian feed. "
-                        "If you are not sure, answer OTHER. "
-                        "Examples: 'Первый канал HD' RU; 'Россия 24' RU; 'Матч ТВ' RU; 'ZDF HD' OTHER; "
-                        "'Das Erste' OTHER; 'RTL Deutschland' OTHER; 'Qazaqstan' OTHER; 'Қазақстан' OTHER; "
-                        "'Khabar 24' OTHER; 'Discovery Channel' OTHER; 'Eurosport 1' OTHER; '1+1' OTHER. "
-                        "Answer strictly one line per channel in the form 'N:RU' or 'N:OTHER'.\n\n" + lines)
+                return (
+                    "You classify TV channels by BROADCAST LANGUAGE. Rules:\n"
+                    "1. Answer RU ONLY IF you are certain the channel broadcasts mainly in Russian: "
+                    "it has a clearly Russian name (Cyrillic), or is a known Russian brand "
+                    "(Первый канал, Россия, НТВ, Матч ТВ, ТНТ, СТС, РЕН ТВ, Карусель, RU.TV и т. п.), "
+                    "or an international brand with an explicit Russian feed (Discovery Russia, Nickelodeon Russia).\n"
+                    "2. German channels are NEVER RU. This includes public (Das Erste, ZDF, ZDFneo, arte, 3sat, Kika, "
+                    "Phoenix, one, tagesschau24, DW), private (RTL, RTL Zwei, SUPER RTL, VOX, ProSieben, Sat.1, "
+                    "Kabel Eins, sixx, Tele 5, DMAX, TNT Comedy, TNT Serie, Sky Atlantic, Sky Sport Bundesliga, "
+                    "Sport1, Sportal, ran), Austrian/Swiss (ORF 1, ORF 2, ServusTV, SRF, Puls 4) and any channel whose "
+                    "name contains German words like 'Doku', 'Serien', 'Filme', 'Heimatkino', 'Nachrichten', 'Wetter', "
+                    "'Hobby', 'Tier', 'Volksmusik', 'Schlager', 'Bundesliga'.\n"
+                    "3. Answer OTHER for everything that is not certainly Russian: German, Kazakh, Ukrainian, "
+                    "Belarusian, English, Turkish, Polish, Arabic etc., and international channels without an "
+                    "explicit Russian feed.\n"
+                    "4. If you are not sure, answer OTHER. Never guess RU.\n"
+                    "Examples: 'Первый канал HD' RU; 'Россия 24' RU; 'Матч ТВ' RU; 'Discovery Россия' RU; "
+                    "'ZDF HD' OTHER; 'Das Erste' OTHER; 'RTL Deutschland' OTHER; 'VOX' OTHER; 'ProSieben FUN' OTHER; "
+                    "'Sky Sport Bundesliga 1' OTHER; 'Tele 5 HD' OTHER; 'arte' OTHER; 'Qazaqstan' OTHER; "
+                    "'Қазақстан' OTHER; 'Khabar 24' OTHER; 'Discovery Channel' OTHER; 'Eurosport 1' OTHER; '1+1' OTHER.\n"
+                    "Answer strictly one line per channel in the form 'N:RU' or 'N:OTHER'. Do not add comments.\n\n"
+                    + lines
+                )
 
             def parse(text):
                 out = {}

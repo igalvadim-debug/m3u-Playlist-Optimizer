@@ -30,8 +30,21 @@ GENRE_KEYWORDS = {
 class M3UConverter:
     def __init__(self, font_path):
         self.font_path = font_path
+        # если указанного шрифта нет — ищем любой TTF рядом или берём встроенный Vera
+        if not os.path.isfile(font_path):
+            font_dir = Path(font_path).parent
+            candidates = sorted(font_dir.glob("*.ttf")) if font_dir.is_dir() else []
+            if candidates:
+                font_path = str(candidates[0])
+                self.font_path = font_path
         if os.path.isfile(font_path):
             pdfmetrics.registerFont(TTFont('DejaVu', font_path))
+        else:
+            # запасной вариант — встроенный шрифт reportlab (Vera)
+            import reportlab
+            fallback = Path(reportlab.__file__).parent / 'fonts' / 'Vera.ttf'
+            if fallback.is_file():
+                pdfmetrics.registerFont(TTFont('DejaVu', str(fallback)))
     
     def extract_group_and_channel(self, line):
         if not line.startswith('#EXTINF:'):
@@ -134,33 +147,38 @@ class M3UConverter:
     <h1>📺 Playlist Summary</h1>
 '''
         for filename, groups in all_data.items():
-            html += f'\n    <div class="file">\n        <h2>📁 {filename}</h2>\n'
+            html += f'\n    <div class="file">\n        <h2>📁 {escape(filename)}</h2>\n'
             if not groups:
                 html += '        <p>Нет каналов</p>\n'
             else:
                 for group_name in sorted(groups.keys()):
                     emoji = self.find_emoji_for_group(group_name)
                     display = f"{emoji} {group_name}" if emoji else group_name
-                    html += f'        <div class="group">\n            <div class="group-name">🔹 {display}</div>\n'
+                    html += f'        <div class="group">\n            <div class="group-name">🔹 {escape(display)}</div>\n'
                     for ch in sorted(set(groups[group_name])):
-                        html += f'            <div class="channel">{ch}</div>\n'
+                        html += f'            <div class="channel">{escape(ch)}</div>\n'
                     html += '        </div>\n'
             html += '    </div>\n'
         html += '</body>\n</html>'
         return html
     
+    @staticmethod
+    def _md_escape(text):
+        """Экранирование Markdown-спецсимволов в незащищённых подписях каналов/групп."""
+        return re.sub(r"([\\`*_\[\]<>|])", r"\\\1", text)
+
     def build_markdown_content(self, all_data):
         md = "# 📺 Playlist Summary\n\n"
         for filename, groups in all_data.items():
-            md += f"## 📁 {filename}\n\n"
+            md += f"## 📁 {self._md_escape(filename)}\n\n"
             if not groups:
                 md += "Нет каналов\n\n"
             else:
                 for group_name in sorted(groups.keys()):
                     emoji = self.find_emoji_for_group(group_name)
                     display = f"{emoji} {group_name}" if emoji else group_name
-                    md += f"### 🔹 {display}\n\n"
+                    md += f"### 🔹 {self._md_escape(display)}\n\n"
                     for ch in sorted(set(groups[group_name])):
-                        md += f"- {ch}\n"
+                        md += f"- {self._md_escape(ch)}\n"
                     md += "\n"
         return md
