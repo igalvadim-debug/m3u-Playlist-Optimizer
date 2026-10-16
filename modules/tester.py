@@ -14,9 +14,6 @@ import sys
 
 
 class M3UTester:
-    # Аудио-кодеки, которые наш плеер (ExoPlayer + системные декодеры) не воспроизводит: MPEG-1 Layer I/II
-    BAD_AUDIO = {'mp1', 'mp2'}
-
     def __init__(self, timeout=8, max_workers=15):
         self.timeout = timeout
         self.max_workers = max_workers
@@ -242,21 +239,17 @@ class M3UTester:
                 progress_callback("⚠️ Прервано пользователем!")
             raise
         
-        # Разделяем рабочие потоки: с нормальным аудио и с неподдерживаемым (MP2/MP1)
-        self.bad_audio_streams = [s for s in self.working_streams if s.get('audio') in self.BAD_AUDIO]
-        self.ok_streams = [s for s in self.working_streams if s.get('audio') not in self.BAD_AUDIO]
-        self.stats['streams_bad_audio'] = len(self.bad_audio_streams)
         # Формируем выходной M3U файл
         output_lines = ["#EXTM3U\n"]
         output_lines.append(f"# Сгенерировано: {datetime.now().isoformat()}\n")
         output_lines.append(f"# Всего протестировано: {self.stats['streams_tested']}\n")
-        output_lines.append(f"# Рабочих потоков (со звуком): {len(self.ok_streams)}, без звука (MP2/MP1): {len(self.bad_audio_streams)}\n")
+        output_lines.append(f"# Рабочих потоков: {len(self.working_streams)}\n")
         output_lines.append(f"# Дубликатов удалено: {self.stats['streams_duplicate']}\n")
         output_lines.append("#" + "="*60 + "\n\n")
         
         # Сортируем по исходному файлу
         current_source = None
-        for stream in sorted(self.ok_streams, key=lambda x: x.get('source_file', '')):
+        for stream in sorted(self.working_streams, key=lambda x: x.get('source_file', '')):
             # Добавляем разделитель между источниками
             if stream.get('source_file') != current_source:
                 current_source = stream.get('source_file')
@@ -267,17 +260,4 @@ class M3UTester:
             output_lines.append(f"{stream['info']}\n")
             output_lines.append(f"{stream['url']}\n")
         
-        # Отдельный файл — только каналы с неподдерживаемым аудио (MP2/MP1)
-        self.bad_audio_lines = ["#EXTM3U\n"]
-        self.bad_audio_lines.append(f"# Каналы без звука в приложении (MP2/MP1): {datetime.now().isoformat()}\n")
-        self.bad_audio_lines.append(f"# Таких каналов: {len(self.bad_audio_streams)}\n\n")
-        _cur = None
-        for _s in sorted(self.bad_audio_streams, key=lambda x: x.get('source_file', '')):
-            if _s.get('source_file') != _cur:
-                _cur = _s.get('source_file')
-                if _cur:
-                    self.bad_audio_lines.append(f"\n# ИСТОЧНИК: {_cur}\n")
-            self.bad_audio_lines.append(f"{_s['info']}\n")
-            self.bad_audio_lines.append(f"{_s['url']}\n")
-
         return output_lines, self.stats

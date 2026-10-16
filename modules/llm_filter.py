@@ -9,6 +9,7 @@ M3U LLM-Filter Module
 """
 import base64
 import json
+import logging
 import os
 import re
 import shutil
@@ -24,18 +25,22 @@ from pathlib import Path
 
 from modules.tester import M3UTester
 
+logger = logging.getLogger("m3ugenius.llm_filter")
+
 
 # ---------------------------------------------------------------------------
-# Настройки
+# Настройки (переопределяются переменными окружения)
 # ---------------------------------------------------------------------------
-LLM_HOST = "127.0.0.1"
-LLM_PORT = 7845
+LLM_HOST = os.environ.get("M3UGENIUS_LLM_HOST", "127.0.0.1")
+LLM_PORT = int(os.environ.get("M3UGENIUS_LLM_PORT", "7845"))
 
-SERVER_EXE = Path(r"D:\Unsloth\C-claude\llama.cpp\llama-server.exe")
-MODEL_PATH = Path(r"C:\ai_diffusion\models\LLM\Qwen3-VL-4B-Instruct-abliterated.Q8_0.gguf")
-MMPROJ_PATH = Path(r"C:\ai_diffusion\models\LLM\mmproj-F16.gguf")
+SERVER_EXE = Path(os.environ.get("M3UGENIUS_LLAMA_SERVER", r"D:\Unsloth\C-claude\llama.cpp\llama-server.exe"))
+MODEL_PATH = Path(os.environ.get(
+    "M3UGENIUS_MODEL_PATH", r"C:\ai_diffusion\models\LLM\Qwen3-VL-4B-Instruct-abliterated.Q8_0.gguf"))
+MMPROJ_PATH = Path(os.environ.get(
+    "M3UGENIUS_MMPROJ_PATH", r"C:\ai_diffusion\models\LLM\mmproj-F16.gguf"))
 
-SERVER_LOG = Path("outputs") / "llama_server_7845.log"
+SERVER_LOG = Path(os.environ.get("M3UGENIUS_OUTPUT_DIR", "outputs")) / "llama_server_7845.log"
 SERVER_START_TIMEOUT = 240  # секунд на загрузку модели
 FRAME_STEP = 1.5  # интервал между кадрами одного канала, секунды (заглушки-анимации меняются во времени)
 
@@ -71,15 +76,66 @@ def _top_reasons(dead, top=3):
     return sorted(((c, k) for k, c in counts.items()), reverse=True)[:top]
 
 
+# Кодеки аудио из вывода ffprobe: пустота или «не-звук» — плохое аудио канала
+_AUDIO_OK_CODECS = {"aac", "mp3", "mp2", "mp2float", "ac3", "eac3", "opus", "vorbis", "pcm_s16le",
+                    "pcm_s16be", "pcm_s24le", "pcm_f32le", "adts", "alac", "flac", "amrnb", "amrwb",
+                    "cook", "atrc", "sipr", "ra_144", "ra_288", "dca", "truehd", "mp4als"}
+
+
+def _probe_audio(url, timeout=8):
+    """Проверить аудио дорожку потока через ffprobe.
+
+    Возвращает True (аудио в порядке), False (аудио нет или оно не звуковое)
+    либо None (проверить невозможно: ffprobe молчит/таймаут — канал остаётся в плейлисте).
+    """
+    cmd = ["ffprobe", "-hide_banner", "-loglevel", "error",
+           "-select_streams", "a",
+           "-show_entries", "stream=codec_type,codec_name",
+           "-of", "csv=p=0", url]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    try:
+        out, _ = proc.communicate(timeout=timeout + 2)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        return None
+    text = (out or b"").decode("utf-8", errors="ignore")
+    codecs = []
+    types = []
+    for line in text.splitlines():
+        parts = [p.strip().lower() for p in line.split(",")]
+        if not any(parts):
+            continue
+        if "audio" in parts:
+            types.append("audio")
+        codecs.extend(p for p in parts if p and p != "audio")
+    if not codecs and not types:
+        # ffprobe ничего не нашёл: таймаут сети или действительно нет аудио
+        if proc.returncode == 0:
+            return False
+        return None
+    if "audio" not in types:
+        return False
+    return all(c in _AUDIO_OK_CODECS for c in codecs)
+
+
 class LLMFilter:
     def __init__(self, ffmpeg_timeout=8, ffmpeg_workers=15, llm_workers=2,
-                 remove_no_frame=False, frames_per_channel=3, keep_server=False):
+                 remove_no_frame=False, frames_per_channel=3, keep_server=False,
+                 check_bad_audio=True):
         self.keep_server = bool(keep_server)
         self.ffmpeg_timeout = int(ffmpeg_timeout)
         self.ffmpeg_workers = int(ffmpeg_workers)
         self.llm_workers = max(1, int(llm_workers))
         self.remove_no_frame = bool(remove_no_frame)
         self.frames_per_channel = max(1, min(8, int(frames_per_channel)))
+        self.check_bad_audio = bool(check_bad_audio)
 
         self._proc = None
         self._own_server = False
@@ -313,7 +369,8 @@ class LLMFilter:
             "ffmpeg_working": 0, "ffmpeg_dead": 0,
             "checked": 0, "payment": 0, "ok": 0,
             "no_frame": 0, "no_frame_removed": 0, "llm_errors": 0,
-            "kept": 0, "interrupted": False, "bad_audio": 0,
+            "bad_audio": 0, "bad_audio_removed": 0,
+            "kept": 0, "interrupted": False,
         }
 
         # ---------------- Шаг 1: FFmpeg ----------------
@@ -408,27 +465,62 @@ class LLMFilter:
 
         working.sort(key=lambda s: s["idx"])
 
-        # Отделяем каналы с неподдерживаемым аудио (MP2/MP1): в LLM не идут, в отдельный файл
-        self._bad_audio = [s for s in working if s.get("audio") in M3UTester.BAD_AUDIO]
-        if self._bad_audio:
-            working = [s for s in working if s.get("audio") not in M3UTester.BAD_AUDIO]
-            self._emit(0.5, "FFmpeg: аудио", f"🔇 Без звука (MP2/MP1): {len(self._bad_audio)} — в отдельный файл")
-        stats["bad_audio"] = len(self._bad_audio)
         kept, removed = [], []
+        bad_audio = []
 
         if stats["interrupted"]:
-            return self._build(kept, removed, stats)
+            return self._build(kept, removed, stats, bad_audio)
 
         if not working:
             self._emit(1.0, "Готово", "⚠️ Рабочих потоков не найдено")
-            return self._build(kept, removed, stats)
+            return self._build(kept, removed, stats, bad_audio)
 
-        # ---------------- Шаг 2: модель ----------------
+        # ---------------- Шаг 2: плохое аудио (ffprobe) ----------------
+        # Каналы без звуковой дорожки откладываются в отдельный список:
+        # они НЕ попадают ни в сортировку, ни в основной плейлист.
+        if self.check_bad_audio:
+            self._emit(0.5, "Проверка аудио", f"🔊 Шаг 2: ffprobe проверяет аудио у {len(working)} рабочих каналов")
+            aud_checked, aud_ok = [], []
+            with ThreadPoolExecutor(max_workers=self.ffmpeg_workers) as ex:
+                futures = {ex.submit(_probe_audio, s["url"], self.ffmpeg_timeout): s for s in working}
+                done = 0
+                total = len(futures)
+                for fut in as_completed(futures):
+                    if self._stopped():
+                        for f2 in futures:
+                            f2.cancel()
+                        stats["interrupted"] = True
+                        return self._build(kept, removed, stats, bad_audio)
+                    s = futures[fut]
+                    try:
+                        verdict = fut.result()
+                    except Exception:
+                        verdict = None
+                    done += 1
+                    if verdict is False:
+                        stats["bad_audio"] += 1
+                        bad_audio.append(s)
+                        line = f"🔇 Плохое аудио (нет звуковой дорожки): {self.channel_name(s['info'])}"
+                    else:
+                        # True или None (не удалось проверить) — канал остаётся
+                        aud_ok.append(s)
+                        line = None
+                    aud_checked.append(s)
+                    if done % 25 == 0 or done == total:
+                        self._emit(0.5 + 0.1 * done / max(1, total),
+                                   f"Аудио: {done}/{total} · проблемных {stats['bad_audio']}", line)
+            working = [s for s in aud_checked if s in set(map(id, []))] if False else \
+                sorted(aud_ok, key=lambda s: s["idx"])
+            self._emit(0.6, "Модель: подготовка",
+                       f"🔇 Отложено из-за плохого аудио: {stats['bad_audio']}, дальше проверяются {len(working)}")
+
+        # ---------------- Шаг 3: модель ----------------
         try:
             self.start_server()
 
             n = len(working)
-            self._emit(0.5, f"Модель: 0/{n}", f"🤖 Шаг 2: модель проверяет {n} рабочих каналов")
+            if n:
+                self._emit(0.6, f"Модель: 0/{n}", f"🤖 Модель проверяет {n} рабочих каналов")
 
             pool_size = self.llm_workers * 4
             sem = threading.Semaphore(self.llm_workers)
@@ -512,7 +604,6 @@ class LLMFilter:
 
     # ------------------------------------------------------------------
     def _build(self, kept, removed, stats):
-        bad_audio = getattr(self, '_bad_audio', [])
         stats["kept"] = len(kept)
         now = datetime.now().isoformat()
 
@@ -531,12 +622,5 @@ class LLMFilter:
             removed_lines.append(f"{s['info']}\n")
             removed_lines.append(f"{s['url']}\n")
 
-        bad_audio_lines = ["#EXTM3U\n",
-                           f"# Каналы без звука в приложении (MP2/MP1) — {now}\n",
-                           f"# Таких каналов: {len(bad_audio)}\n\n"]
-        for s in bad_audio:
-            bad_audio_lines.append(f"{s['info']}\n")
-            bad_audio_lines.append(f"{s['url']}\n")
-
         return {"kept_lines": kept_lines, "removed_lines": removed_lines, "kept_streams": kept,
-                "bad_audio_lines": bad_audio_lines, "stats": stats}
+                "stats": stats}
