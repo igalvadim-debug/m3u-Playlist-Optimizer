@@ -63,7 +63,10 @@ def _resolve_epg(dropdown, custom):
         s = str(d).strip()
         if s:
             parts.append(s)
-    c = (custom or "").strip()
+    if isinstance(custom, bool) or custom is None:
+        c = ""  # защита от случайной передачи флага вместо строки
+    else:
+        c = str(custom).strip()
     if c:
         parts.append(c)
     return epg_from_choice(parts) if parts else ""
