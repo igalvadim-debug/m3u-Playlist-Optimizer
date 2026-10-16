@@ -29,6 +29,18 @@ GENRE_KEYWORDS = {
 
 class M3UConverter:
     def __init__(self, font_path):
+        """Register a PDF font globally under the name ``DejaVu``.
+
+        If font_path is missing, select the first TTF in its directory with
+        glyphs for the Russian alphabet, including Yo, and update self.font_path.
+        If it exists, search system font directories for a font whose best
+        character map contains Cyrillic A and lowercase Ya instead.
+
+        Raise FileNotFoundError if no suitable neighboring font is found, or
+        RuntimeError if the system search fails. Invalid neighboring TTFs are
+        skipped; other loading or registration errors in that branch propagate.
+        System font errors are caught while the search continues.
+        """
         self.font_path = font_path
         # Если указанного шрифта нет, ищем рядом TTF с поддержкой русского алфавита.
         if not os.path.isfile(font_path):
@@ -158,6 +170,11 @@ class M3UConverter:
         return story
     
     def build_html_content(self, all_data):
+        """Return an HTML document from a filename -> group -> channel list mapping.
+
+        Labels are escaped as text. Files retain input order; groups and unique
+        channel names are sorted. Empty files receive a no-channels message.
+        """
         html = '''<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -198,6 +215,11 @@ class M3UConverter:
         return re.sub(r"([\\`*_\[\]<>|])", r"\\\1", text)
 
     def build_markdown_content(self, all_data):
+        """Return Markdown from a filename -> group -> channel list mapping.
+
+        Labels use _md_escape. Files retain input order; groups and unique
+        channel names are sorted. Empty files receive a no-channels message.
+        """
         md = "# 📺 Playlist Summary\n\n"
         for filename, groups in all_data.items():
             md += f"## 📁 {self._md_escape(filename)}\n\n"

@@ -24,9 +24,15 @@ MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024  # потолок на скачанный
 
 
 def _safe_socket_connect(address, timeout=None, source_address=None, *, all_errors=False):
-    """socket.create_connection с проверкой: запрещённые адреса (SSRF-guard, в т. ч. DNS-rebinding).
-    Совместим по сигнатуре с socket.create_connection (используется как instance-level
-    _create_connection в HTTPConnection.connect)."""
+    """Return a socket connected to the first resolved (host, port) address.
+
+    Reject the host with ValueError if any resolved IP is non-global. Use the
+    validated address directly, with an optional local source_address binding.
+    timeout is in seconds; None blocks, and the socket default sentinel leaves
+    the default unchanged. all_errors is accepted but ignored; no retry occurs.
+    DNS and socket OSErrors propagate, including an empty resolution result;
+    a socket whose connect call fails is closed before the error is re-raised.
+    """
     host, port = address
     infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
     if not infos:
@@ -54,6 +60,7 @@ class _SafeHTTPConnection(http.client.HTTPConnection):
     self._create_connection (по умолчанию socket.create_connection)."""
 
     def __init__(self, *args, **kwargs):
+        """Accept HTTPConnection options and guard this instance's connections."""
         super().__init__(*args, **kwargs)  # базовый init присваивает self._create_connection
         self._create_connection = _safe_socket_connect
 
@@ -63,17 +70,20 @@ class _SafeHTTPSConnection(http.client.HTTPSConnection):
     который берёт self._create_connection — guard наследуется без глобального monkey-patch."""
 
     def __init__(self, *args, **kwargs):
+        """Accept HTTPSConnection options and guard this instance's connections."""
         super().__init__(*args, **kwargs)
         self._create_connection = _safe_socket_connect
 
 
 class _SafeHTTPHandler(urllib.request.HTTPHandler):
     def http_open(self, req):
+        """Open req with guarded HTTP connections, propagating urllib errors."""
         return self.do_open(_SafeHTTPConnection, req)
 
 
 class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req):
+        """Open req with guarded HTTPS connections, propagating urllib errors."""
         return self.do_open(_SafeHTTPSConnection, req)
 
 
@@ -81,6 +91,11 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Проверяет каждую цель редиректа через validate_epg_url (в т. ч. смену схемы на ftp и т. п.)."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Validate newurl before delegating redirect handling to urllib.
+
+        Return urllib's redirected request or None. Raise HTTPError for a
+        rejected target; validation and urllib redirect errors propagate.
+        """
         reason = validate_epg_url(newurl)
         if reason:
             raise urllib.error.HTTPError(req.full_url, code, f"редирект запрещён: {reason}", headers, fp)
@@ -91,7 +106,13 @@ _opener = urllib.request.build_opener(_SafeHTTPHandler(), _SafeHTTPSHandler(), _
 
 
 def validate_epg_url(url):
-    """Проверяет, что ссылка безопасна для скачивания. Возвращает причину отказа или None."""
+    """Return a rejection reason, or None for an HTTP(S) URL with global IPs.
+
+    Check a literal IP or every current DNS answer. Missing hosts, empty DNS
+    answers, DNS lookup failures, and ValueErrors from parsing are returned as
+    reasons. Other resolver OSErrors propagate. This check does not connect;
+    the connection guard validates DNS again when opening a socket.
+    """
     try:
         parsed = urllib.parse.urlsplit(url)
     except ValueError:
@@ -171,10 +192,20 @@ class _LimitedRead:
     """File-like обёртка: отдаёт не более limit байт, дальше — пустой поток (защита от OOM)."""
 
     def __init__(self, stream, limit):
+        """Wrap a binary stream with a total byte budget of int(limit).
+
+        A nonpositive budget yields an empty stream. Errors converting limit
+        to an integer propagate.
+        """
         self._s = stream
         self._left = int(limit)
 
     def read(self, n=-1):
+        """Read at most n bytes within the remaining total budget.
+
+        None or a negative n requests the remaining budget. Return empty bytes
+        once exhausted; underlying read errors propagate.
+        """
         if self._left <= 0:
             return b""
         if n is None or n < 0:
@@ -185,6 +216,11 @@ class _LimitedRead:
         return data
 
     def readline(self, limit=-1):
+        """Read through a newline or EOF within the remaining byte budget.
+
+        A negative limit adds no line limit. A nonnegative limit caps the line,
+        except that zero still attempts to read one byte. Read errors propagate.
+        """
         # для совместимости с gzip.GzipFile(fileobj=...), который читает заголовок построчно
         chunk = self.read(1)
         line = chunk
@@ -196,6 +232,7 @@ class _LimitedRead:
         return line
 
     def seek(self, *args):
+        """Always raise io.UnsupportedOperation because seeking is unsupported."""
         raise io.UnsupportedOperation("seek")
 
     seekable = lambda self: False
@@ -258,6 +295,14 @@ class EpgBuilder:
     # ---------- поток ----------
     @staticmethod
     def _open_stream(url, timeout=300):
+        """Open a guarded HTTP(S) response as a binary stream, decoding gzip.
+
+        timeout is the socket timeout in seconds. Both downloaded bytes and
+        decompressed bytes are capped at MAX_DOWNLOAD_BYTES (512 MiB by default);
+        the cap appears as EOF. Gzip is detected by its magic bytes.
+        Connection and URL errors propagate here; read and decompression errors
+        can also propagate when the returned stream is consumed.
+        """
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (m3uGenius)"})
         resp = _opener.open(req, timeout=timeout)  # SSRF-guard: соединение только с публичными IP
         # Потолковый лимит объёма скачивания (защита от «бесконечного» ответа / OOM)
@@ -305,6 +350,18 @@ class EpgBuilder:
         root.clear()
 
     def build(self, m3u_files, source_urls, progress_cb=None):
+        """Return filtered XMLTV bytes and a normalized display-name -> ID mapping.
+
+        Read channel names from M3U paths and process comma- or newline-separated
+        source_urls in order. Unreadable playlists are ignored. Reject invalid
+        sources and record reasons in stats['errors']; download and XML parsing
+        errors are also recorded, retaining any output already collected.
+        Empty inputs still return a tv wrapper and an empty mapping.
+
+        Update this instance's cumulative statistics and call progress_cb with
+        progress messages when supplied. Callback errors and unexpected resolver
+        errors during URL validation propagate.
+        """
         def log(m):
             if progress_cb:
                 progress_cb(m)
