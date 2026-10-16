@@ -221,7 +221,13 @@ class Organizer:
     # ------------------------------------------------------------------
     @staticmethod
     def _lang_score(e):
-        """Оценить признаки русского языка в name, group и attrs: чем выше, тем вероятнее русский."""
+        """Score Russian-language evidence in an entry's name, group, and attrs.
+
+        Higher scores favor Russian; _detect_language treats >= 2 as Russian
+        and <= -2 as foreign. Foreign name markers can override Russian metadata.
+        A foreign topic found only in the group is weakened when the name has
+        Russian letters or explicit Russian language/ID metadata is present.
+        """
         name, group, attrs = e["name"], e["group"], e["attrs"]
         score = 0
         if _UKR.search(name) or _LATIN_EXT.search(name):
@@ -273,6 +279,13 @@ class Organizer:
         return score
 
     def _detect_language(self, entries):
+        """Set score and ru fields on entries in place using rules and an optional LLM.
+
+        Ask the model about borderline scores and Russian candidates without
+        Russian letters in their names; the latter can only be downgraded.
+        Model request errors are counted and use the rule result. Unresolved
+        entries become foreign. Progress callback errors propagate.
+        """
         undecided = []
         weak = []
         for e in entries:
@@ -297,6 +310,7 @@ class Organizer:
             items = [(id(e), f"{e['name']} | group: {e['group'] or '-'}") for e in check]
 
             def make_prompt(chunk):
+                """Return a numbered RU/OTHER prompt for (entry ID, label) pairs."""
                 lines = "\n".join(f"{i}. {t}" for i, (_, t) in enumerate(chunk, 1))
                 return (
                     "You classify TV channels by BROADCAST LANGUAGE. Rules:\n"
