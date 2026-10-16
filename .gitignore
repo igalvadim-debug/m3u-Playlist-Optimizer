@@ -4,3 +4,4 @@ __pycache__/
 modules.zip
 /modules/.env
 .env
+/outputs
