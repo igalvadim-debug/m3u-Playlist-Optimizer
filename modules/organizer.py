@@ -240,8 +240,15 @@ class Organizer:
             # кириллическое название или явные русские метаданные
             if group and not _NONRU_NAME.search(name) and (has_cyr_name or explicit_ru_meta):
                 score -= 1
+                if has_cyr_name:
+                    score += 2   # кириллическое имя перевешивает немецкий топик группы
+                elif id_is_ru:
+                    score += 1   # явный .ru tvg-id тоже перевешивает топик группы
             else:
                 return -4
+        elif explicit_ru_meta:
+            # явные русские метаданные перевешивают немецкий топики в названии/группе
+            score += 2
         # точное совпадение с известным немецким каналом (после снятия HD/SD и скобок)
         if _norm(name) in _DE_NAMES:
             return -4
@@ -273,7 +280,12 @@ class Organizer:
             e["score"] = s
             if s >= 2:
                 e["ru"] = True
-                if not _CYR.search(e["name"]):
+                has_ru_signal = _CYR.search(e["name"]) or _RU_LATIN.search(e["name"]) or \
+                    _RU_BRANDS.search(e["name"]) or \
+                    bool((e["attrs"].get("tvg-language") or "").lower() and _RU_LANG.search(e["attrs"]["tvg-language"])) or \
+                    bool(_TVGID_CC.search((e["attrs"].get("tvg-id") or "").lower().strip()) and
+                         _TVGID_CC.search((e["attrs"].get("tvg-id") or "").lower().strip()).group(1) == "ru")
+                if not has_ru_signal:
                     weak.append(e)   # русский только по косвенным признакам: перепроверит модель
             elif s <= -2:
                 e["ru"] = False
