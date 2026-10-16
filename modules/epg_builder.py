@@ -37,7 +37,7 @@ def _safe_socket_connect(address, timeout=None, source_address=None, *, all_erro
             raise ValueError(f"EPG-источник указывает на запрещённый адрес: {ip}")
     family, stype, proto, _, addr = infos[0]
     sock = socket.socket(family, stype, proto)
-    if timeout is not None:
+    if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
         sock.settimeout(timeout)
     if source_address:
         sock.bind(source_address)

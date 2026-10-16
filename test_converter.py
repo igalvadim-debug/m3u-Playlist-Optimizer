@@ -1,9 +1,10 @@
 """Regression tests for untrusted playlist labels in PDF paragraphs."""
 import io
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import reportlab
 from reportlab.platypus import Paragraph, SimpleDocTemplate
@@ -56,6 +57,36 @@ class ConverterPDFTests(unittest.TestCase):
                 SimpleDocTemplate(document).build(story)
                 reader.assert_not_called()
                 self.assertTrue(document.getvalue().startswith(b'%PDF-'))
+
+
+class ConverterFontFallbackTests(unittest.TestCase):
+    def test_fallback_skips_latin_only_font(self):
+        with tempfile.TemporaryDirectory() as folder:
+            latin = Path(folder) / 'a-latin.ttf'
+            cyrillic = Path(folder) / 'b-cyrillic.ttf'
+            latin.touch()
+            cyrillic.touch()
+            required = set(range(0x0410, 0x0450)) | {0x0401, 0x0451}
+            fonts = [Mock(face=Mock(charToGlyph={ord('A'): 1})),
+                     Mock(face=Mock(charToGlyph=dict.fromkeys(required, 1)))]
+            with patch('modules.converter.TTFont', side_effect=fonts), \
+                    patch('modules.converter.pdfmetrics.registerFont') as register:
+                converter = M3UConverter(str(Path(folder) / 'missing.ttf'))
+            self.assertEqual(converter.font_path, str(cyrillic))
+            register.assert_called_once_with(fonts[1])
+
+    def test_missing_font_and_vera_fallback_fail_clearly(self):
+        with tempfile.TemporaryDirectory() as folder:
+            missing = str(Path(folder) / 'DejaVuSans.ttf')
+            for add_vera in (False, True):
+                if add_vera:
+                    vera = Path(reportlab.__file__).parent / 'fonts' / 'Vera.ttf'
+                    shutil.copyfile(vera, Path(folder) / 'Vera.ttf')
+                with self.subTest(vera=add_vera), \
+                        patch('modules.converter.pdfmetrics.registerFont') as register:
+                    with self.assertRaisesRegex(FileNotFoundError, 'кириллицы.*DejaVuSans.ttf'):
+                        M3UConverter(missing)
+                    register.assert_not_called()
 
 
 if __name__ == '__main__':
