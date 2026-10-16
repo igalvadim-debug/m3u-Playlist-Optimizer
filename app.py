@@ -5,6 +5,7 @@ m3uGenius - Gradio Interface
 """
 import gzip
 import gradio as gr
+import json
 import os
 import queue
 import threading
@@ -16,7 +17,8 @@ from modules.tester import M3UTester
 from modules.converter import M3UConverter
 from modules.merger import M3UMerger
 from modules.llm_filter import LLMFilter, LLM_PORT
-from modules.header import DEFAULT_EPG, apply_header, EPG_CHOICES, EPG_TITLES, epg_from_choice
+from modules.header import (DEFAULT_EPG, apply_header, EPG_CHOICES, EPG_SOURCES,
+                           EPG_TITLES, epg_from_choice)
 from modules.m3u_utils import parse_m3u, url_key, set_group, split_extinf
 from modules.organizer import Organizer
 
@@ -68,26 +70,121 @@ def _resolve_epg(dropdown, custom):
 
 
 def _epg_dropdown(label="EPG ссылка (url-tvg)", multi=False, value=None):
-    """Выпадающий список готовых EPG-источников; свой URL можно ввести прямо здесь."""
+    """Выпадающий список готовых EPG-источников; свой URL можно ввести прямо здесь.
+    Подсказка показывается только при наведении мыши (tooltip), без видимого текста."""
     return gr.Dropdown(label=label, choices=EPG_CHOICES,
                        value=value if not multi else (value or []),
                        multiselect=multi, allow_custom_value=True, interactive=True,
                        elem_classes=["epg-tip"], visible=True)
 
 
-def _epg_titles_js(text):
-    """JS: всплывающий текст-пояснение при наведении мыши на выпадающий список EPG.
-    Никаких видимых подписей — только tooltip (атрибут title)."""
-    payload = json.dumps({"tip": text})
-    return f"""
-    () => {{
-        const d = {payload};
-        document.querySelectorAll('.epg-tip').forEach(el => {{
-            el.setAttribute('title', d.tip);
-            el.querySelectorAll('input, button, [role="combobox"]').forEach(x => x.setAttribute('title', d.tip));
-        }});
-    }}
-    """
+# Подсказки для пунктов раскрытого списка: "название — пояснение со ссылкой"
+EPG_ITEMS_TIP = "\n".join(f"{name} \u2014 {tip}" for name, _, tip in EPG_SOURCES)
+# Тот же текст в виде JS-объекта {название: пояснение} — поиск по aria-label пункта
+EPG_ITEMS_MAP = {name: tip for name, _, tip in EPG_SOURCES}
+
+# CSS+JS для тултипов: текст-пояснение всплывает ТОЛЬКО при наведении мыши,
+# никаких видимых подписей под списком. Работает и для пунктов выпадающего списка.
+EPG_HEAD_HTML = """
+<style>
+/* стилизованный тултип; виден только при наведении мыши */
+.epg-tooltip {
+    position: fixed;
+    z-index: 99999;
+    max-width: 560px;
+    background: #1f2937;
+    color: #f9fafb;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-line;
+    box-shadow: 0 4px 16px rgba(0,0,0,.35);
+    pointer-events: none;
+    display: none;
+}
+.epg-tip input, .epg-tip button { cursor: help; }
+li[data-testid="dropdown-option"] { cursor: help; }
+</style>
+<script>
+(function () {
+    const ITEMS = __ITEMS__;
+    const TIPS = {
+        single: __SINGLE__,
+        multi: __MULTI__
+    };
+    let tipEl = null;
+    function ensureTip() {
+        if (!tipEl || !document.body.contains(tipEl)) {
+            tipEl = document.createElement('div');
+            tipEl.className = 'epg-tooltip';
+            document.body.appendChild(tipEl);
+        }
+        return tipEl;
+    }
+    function showTip(text, x, y) {
+        if (!text) return hideTip();
+        const t = ensureTip();
+        t.textContent = text;
+        t.style.display = 'block';
+        const w = t.offsetWidth, h = t.offsetHeight;
+        const left = Math.min(Math.max(8, x + 14), window.innerWidth - w - 8);
+        let top = y + 18;
+        if (top + h > window.innerHeight - 8) top = Math.max(8, y - h - 12);
+        t.style.left = left + 'px';
+        t.style.top = top + 'px';
+    }
+    function hideTip() { if (tipEl) tipEl.style.display = 'none'; }
+    // тултип у самого списка: вложен в контейнер компонента -> не теряется при перерисовке
+    function attachTip(wrap) {
+        if (!wrap || wrap.dataset.epgTip === '1') return;
+        wrap.dataset.epgTip = '1';
+        const host = wrap.parentElement || wrap;
+        const el = document.createElement('div');
+        el.className = 'epg-tooltip';
+        el.style.pointerEvents = 'none';
+        host.appendChild(el);
+        wrap.addEventListener('mouseover', function (e) {
+            // пункт раскрытого списка -> своя подсказка с ссылкой
+            const li = e.target.closest ? e.target.closest('li[data-testid="dropdown-option"]') : null;
+            if (li) {
+                const name = li.getAttribute('aria-label') || (li.innerText || '').trim().split('\\n')[0];
+                if (ITEMS[name] !== undefined) {
+                    el.textContent = name + ' \\u2014 ' + ITEMS[name];
+                    el.style.display = 'block';
+                    return;
+                }
+            }
+            const multi = !!wrap.querySelector('input[type=checkbox]');
+            const lines = (multi ? TIPS.multi : TIPS.single).split('\\n').filter(s => s.trim());
+            el.textContent = lines.join('\\n');
+            el.style.display = 'block';
+        });
+        wrap.addEventListener('mousemove', function (e) {
+            if (el.style.display !== 'block') return;
+            const r = host.getBoundingClientRect();
+            const w = el.offsetWidth, h = el.offsetHeight;
+            const left = Math.min(Math.max(-r.left + 8, e.clientX - r.left + 14),
+                                  window.innerWidth - r.left - w - 8);
+            let top = e.clientY - r.top + 18;
+            if (top + h > window.innerHeight - r.top - 8) top = Math.max(-r.top + 8, e.clientY - r.top - h - 12);
+            el.style.left = left + 'px';
+            el.style.top = top + 'px';
+        });
+        wrap.addEventListener('mouseout', function (e) {
+            if (!wrap.contains(e.relatedTarget)) el.style.display = 'none';
+        });
+    }
+    function scan() {
+        document.querySelectorAll('.epg-tip').forEach(attachTip);
+    }
+    scan();
+    new MutationObserver(scan).observe(document.body, {childList: true, subtree: true});
+})();
+</script>
+""".replace("__ITEMS__", json.dumps(EPG_ITEMS_MAP, ensure_ascii=False)) \
+   .replace("__SINGLE__", json.dumps(EPG_DROPDOWN_TIP, ensure_ascii=False)) \
+   .replace("__MULTI__", json.dumps(EPG_MULTI_TIP, ensure_ascii=False))
 
 
 def cleaner_function(files, blocklist_text, epg_choice=None, epg_custom="", catchup=True):
@@ -784,7 +881,7 @@ def llm_filter_function(files, timeout, ffmpeg_workers, llm_workers, frames, rem
 
 
 # Создание Gradio интерфейса
-with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
+with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft(), head=EPG_HEAD_HTML) as app:
     gr.Markdown("# 🎯 m3uGenius")
     gr.Markdown("Универсальная обработка M3U плейлистов")
     
