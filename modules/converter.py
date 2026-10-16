@@ -9,7 +9,7 @@ from pathlib import Path
 from collections import defaultdict
 from xml.sax.saxutils import escape
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.ttfonts import TTFont, TTFError
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -30,21 +30,26 @@ GENRE_KEYWORDS = {
 class M3UConverter:
     def __init__(self, font_path):
         self.font_path = font_path
-        # если указанного шрифта нет — ищем любой TTF рядом или берём встроенный Vera
+        # Если указанного шрифта нет, ищем рядом TTF с поддержкой русского алфавита.
         if not os.path.isfile(font_path):
             font_dir = Path(font_path).parent
             candidates = sorted(font_dir.glob("*.ttf")) if font_dir.is_dir() else []
-            if candidates:
-                font_path = str(candidates[0])
-                self.font_path = font_path
-        if os.path.isfile(font_path):
-            pdfmetrics.registerFont(TTFont('DejaVu', font_path))
+            required = set(range(0x0410, 0x0450)) | {0x0401, 0x0451}
+            for candidate in candidates:
+                try:
+                    font = TTFont('DejaVu', str(candidate))
+                except TTFError:
+                    continue
+                if all(font.face.charToGlyph.get(code) for code in required):
+                    self.font_path = str(candidate)
+                    pdfmetrics.registerFont(font)
+                    break
+            else:
+                raise FileNotFoundError(
+                    f"Не найден TTF-шрифт с поддержкой кириллицы. "
+                    f"Установите DejaVuSans.ttf в {font_dir} или укажите путь к шрифту.")
         else:
-            # запасной вариант — встроенный шрифт reportlab (Vera)
-            import reportlab
-            fallback = Path(reportlab.__file__).parent / 'fonts' / 'Vera.ttf'
-            if fallback.is_file():
-                pdfmetrics.registerFont(TTFont('DejaVu', str(fallback)))
+            pdfmetrics.registerFont(TTFont('DejaVu', font_path))
     
     def extract_group_and_channel(self, line):
         if not line.startswith('#EXTINF:'):

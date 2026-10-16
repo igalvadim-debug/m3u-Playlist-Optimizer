@@ -23,8 +23,9 @@ SUFFIXES = ("fullhd", "fhd", "uhd", "4k", "hd", "sd")
 MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024  # потолок на скачанный ответ, защита от OOM/зловредных серверов
 
 
-def _safe_socket_connect(host, port=None, timeout=None, source_address=None):
+def _safe_socket_connect(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
     """socket.create_connection с проверкой: запрещённые адреса (SSRF-guard, в т. ч. DNS-rebinding)."""
+    host, port = address
     infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
     if not infos:
         raise OSError(f"Cannot determine address of {host!r}")
@@ -34,7 +35,7 @@ def _safe_socket_connect(host, port=None, timeout=None, source_address=None):
             raise ValueError(f"EPG-источник указывает на запрещённый адрес: {ip}")
     family, stype, proto, _, addr = infos[0]
     sock = socket.socket(family, stype, proto)
-    if timeout is not None:
+    if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
         sock.settimeout(timeout)
     if source_address:
         sock.bind(source_address)
@@ -47,23 +48,15 @@ def _safe_socket_connect(host, port=None, timeout=None, source_address=None):
 
 
 class _SafeHTTPSConnection(http.client.HTTPSConnection):
-    def connect(self):
-        old = socket.create_connection
-        socket.create_connection = _safe_socket_connect
-        try:
-            super().connect()
-        finally:
-            socket.create_connection = old
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _safe_socket_connect
 
 
 class _SafeHTTPConnection(http.client.HTTPConnection):
-    def connect(self):
-        old = socket.create_connection
-        socket.create_connection = _safe_socket_connect
-        try:
-            super().connect()
-        finally:
-            socket.create_connection = old
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _safe_socket_connect
 
 
 class _SafeHTTPHandler(urllib.request.HTTPHandler):
@@ -76,7 +69,16 @@ class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_SafeHTTPSConnection, req)
 
 
-_opener = urllib.request.build_opener(_SafeHTTPHandler(), _SafeHTTPSHandler())
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        reason = validate_epg_url(newurl)
+        if reason:
+            raise ValueError(f"Небезопасный редирект EPG: {reason}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(
+    _SafeHTTPHandler(), _SafeHTTPSHandler(), _SafeRedirectHandler())
 
 
 def validate_epg_url(url):
@@ -237,7 +239,7 @@ class EpgBuilder:
         stream = _LimitedRead(resp, MAX_DOWNLOAD_BYTES)
         head = stream.read(2)
         if head == b"\x1f\x8b":
-            return gzip.GzipFile(fileobj=_Prepend(head, stream))
+            return _LimitedRead(gzip.GzipFile(fileobj=_Prepend(head, stream)), MAX_DOWNLOAD_BYTES)
         return _Prepend(head, stream)
 
     # ---------- фильтрация ----------

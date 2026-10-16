@@ -226,7 +226,7 @@ class Organizer:
         score = 0
         if _UKR.search(name) or _LATIN_EXT.search(name):
             return -4
-        if _NONRU_NAME.search(name) or (group and _NONRU_NAME.search(group)):
+        if _NONRU_NAME.search(name):
             return -4
         # точное совпадение с известным немецким каналом (после снятия HD/SD и скобок)
         if _norm(name) in _DE_NAMES:
@@ -241,6 +241,10 @@ class Organizer:
             score += 3 if _RU_LANG.search(lang) else -3
         tvg_id = (attrs.get("tvg-id") or "").lower().strip()
         m = _TVGID_CC.search(tvg_id)
+        # Тема группы слабее явного языка трансляции или российского tvg-id.
+        if (group and _NONRU_NAME.search(group)
+                and not (_RU_LANG.search(lang) or (m and m.group(1) == "ru"))):
+            return -4
         if m:
             score += 2 if m.group(1) == "ru" else -3
         elif _TVGID_UNDER_CC.search(tvg_id):
