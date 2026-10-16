@@ -318,7 +318,7 @@ class LLMFilter:
             "ffmpeg_working": 0, "ffmpeg_dead": 0,
             "checked": 0, "payment": 0, "ok": 0,
             "no_frame": 0, "no_frame_removed": 0, "llm_errors": 0,
-            "kept": 0, "interrupted": False, "bad_audio": 0,
+            "kept": 0, "interrupted": False,
         }
 
         # ---------------- Шаг 1: FFmpeg ----------------
@@ -413,12 +413,6 @@ class LLMFilter:
 
         working.sort(key=lambda s: s["idx"])
 
-        # Отделяем каналы с неподдерживаемым аудио (MP2/MP1): в LLM не идут, в отдельный файл
-        self._bad_audio = [s for s in working if s.get("audio") in M3UTester.BAD_AUDIO]
-        if self._bad_audio:
-            working = [s for s in working if s.get("audio") not in M3UTester.BAD_AUDIO]
-            self._emit(0.5, "FFmpeg: аудио", f"🔇 Без звука (MP2/MP1): {len(self._bad_audio)} — в отдельный файл")
-        stats["bad_audio"] = len(self._bad_audio)
         kept, removed = [], []
 
         if stats["interrupted"]:
@@ -517,7 +511,6 @@ class LLMFilter:
 
     # ------------------------------------------------------------------
     def _build(self, kept, removed, stats):
-        bad_audio = getattr(self, '_bad_audio', [])
         stats["kept"] = len(kept)
         now = datetime.now().isoformat()
 
@@ -536,12 +529,5 @@ class LLMFilter:
             removed_lines.append(f"{s['info']}\n")
             removed_lines.append(f"{s['url']}\n")
 
-        bad_audio_lines = ["#EXTM3U\n",
-                           f"# Каналы без звука в приложении (MP2/MP1) — {now}\n",
-                           f"# Таких каналов: {len(bad_audio)}\n\n"]
-        for s in bad_audio:
-            bad_audio_lines.append(f"{s['info']}\n")
-            bad_audio_lines.append(f"{s['url']}\n")
-
         return {"kept_lines": kept_lines, "removed_lines": removed_lines, "kept_streams": kept,
-                "bad_audio_lines": bad_audio_lines, "stats": stats}
+                "stats": stats}

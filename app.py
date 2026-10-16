@@ -98,13 +98,6 @@ def tester_function(files, timeout, workers, epg_url="", catchup=True):
     output_file = output_folder / "tested_working.m3u"
     with open(output_file, 'w', encoding='utf-8') as f:
         f.writelines(result)
-    bad_file = None
-    _bad = getattr(tester, 'bad_audio_lines', None) if getattr(tester, 'bad_audio_streams', None) else None
-    if _bad:
-        bad_file = output_folder / "tested_bad_audio.m3u"
-        with open(bad_file, 'w', encoding='utf-8') as f:
-            f.writelines(apply_header(_bad, epg_url, catchup))
-    
     stats_text = f"""✅ Тестирование завершено!
 
 📊 Статистика:
@@ -113,16 +106,12 @@ def tester_function(files, timeout, workers, epg_url="", catchup=True):
 - Рабочих: {stats['streams_working']} ({stats['streams_working']/max(1,stats['streams_tested'])*100:.1f}%)
 - Нерабочих: {stats['streams_failed']} ({stats['streams_failed']/max(1,stats['streams_tested'])*100:.1f}%)
 - Дубликатов удалено: {stats['streams_duplicate']}
-- Без звука в приложении (MP2/MP1): {stats.get('streams_bad_audio', 0)}
 
 💾 Сохранено:
 - Рабочие: {output_file}
-- Без звука (отдельно): {bad_file if bad_file else '—'}
 """
     
     result_files = [str(output_file)]
-    if bad_file:
-        result_files.append(str(bad_file))
     return result_files, stats_text
 
 
@@ -447,14 +436,10 @@ def llm_filter_function(files, timeout, ffmpeg_workers, llm_workers, frames, rem
             out_files.append(str(kept_file))
             saved.append(f"- Чистый плейлист: {kept_file}")
         removed_file = output_folder / "llm_removed.m3u"
-        bad_audio_file = output_folder / "llm_bad_audio.m3u"
         with open(removed_file, 'w', encoding='utf-8') as f:
             f.writelines(result["removed_lines"])
-        with open(bad_audio_file, 'w', encoding='utf-8') as f:
-            f.writelines(apply_header(result["bad_audio_lines"], epg_url, catchup))
-        out_files += [str(removed_file), str(bad_audio_file)]
+        out_files.append(str(removed_file))
         saved.append(f"- Удалённые (отчёт): {removed_file}")
-        saved.append(f"- Без звука (MP2/MP1): {bad_audio_file}")
 
     text = "✅ Готово!\n"
     if stats:
@@ -467,7 +452,6 @@ def llm_filter_function(files, timeout, ffmpeg_workers, llm_workers, frames, rem
 - Нормальных: {stats['ok']}
 - Кадр не получен: {stats['no_frame']} (удалено из них: {stats['no_frame_removed']})
 - Ошибок модели: {stats['llm_errors']}
-- Без звука (MP2/MP1, отдельно): {stats.get('bad_audio', 0)}
 - Осталось в плейлисте: {stats['kept']}
 """
     if sorted_res is not None:
@@ -523,7 +507,7 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
                     tester_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
                     tester_btn = gr.Button("🚀 Запустить тестирование", variant="primary")
                 with gr.Column():
-                    tester_output = gr.File(label="Результат (рабочие + без звука)", file_count="multiple")
+                    tester_output = gr.File(label="Единый плейлист рабочих потоков (включая MP1/MP2)", file_count="multiple")
                     tester_stats = gr.Textbox(label="Статистика", lines=10)
             
             tester_btn.click(
