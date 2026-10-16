@@ -7,6 +7,7 @@ import os
 import re
 from pathlib import Path
 from collections import defaultdict
+from xml.sax.saxutils import escape
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.pagesizes import letter
@@ -97,7 +98,7 @@ class M3UConverter:
         
         story = []
         for filename, groups in all_data.items():
-            story.append(Paragraph(f"📁 {filename}", title_style))
+            story.append(Paragraph(f"📁 {escape(filename)}", title_style))
             story.append(Spacer(1, 12))
             if not groups:
                 story.append(Paragraph("Нет каналов", channel_style))
@@ -106,9 +107,9 @@ class M3UConverter:
             for group_name in sorted(groups.keys()):
                 emoji = self.find_emoji_for_group(group_name)
                 display = f"{emoji} {group_name}" if emoji else group_name
-                story.append(Paragraph(f"🔹 {display}", group_style))
+                story.append(Paragraph(f"🔹 {escape(display)}", group_style))
                 for ch in sorted(set(groups[group_name])):
-                    story.append(Paragraph(ch, channel_style))
+                    story.append(Paragraph(escape(ch), channel_style))
                 story.append(Spacer(1, 6))
             story.append(Spacer(1, 24))
         return story
