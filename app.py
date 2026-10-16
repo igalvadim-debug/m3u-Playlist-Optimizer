@@ -349,7 +349,8 @@ def _filter_chunk(streams):
 
 
 def _split_foreign_keep(streams):
-    """Отсеивает иностранные каналы (правила Organizer'а, без обращений к модели)."""
+    """Отсеивает иностранные каналы: всё, что не подтверждено как русскоязычное
+    (правила Organizer'а: >= 2 — точно русский; < 2 — сомнительные/иностранные)."""
     from modules.organizer import Organizer
     ru, foreign = [], []
     for s in streams:
@@ -361,7 +362,7 @@ def _split_foreign_keep(streams):
         except Exception:
             pass
         score = Organizer._lang_score(e)
-        (ru if score >= -1 else foreign).append(s)
+        (ru if score >= 2 else foreign).append(s)
     return ru, foreign
 
 
@@ -413,6 +414,10 @@ def run_pipeline(files, epg_choice, epg_custom, catchup=True, do_test=False, tim
 
     def worker():
         try:
+            # Временная папка для нарезки и результатов кусков (удаляется в конце),
+            # отдельная постоянная папка с проверенными каналами: название = день + дата
+            tmp_folder = OUTPUT_DIR / datetime.now().strftime("_tmp_фильтр_%H-%M-%S")
+            tmp_folder.mkdir(parents=True, exist_ok=True)
             verified_folder = create_verified_folder()
             streams, chunks = _load_streams_chunked(file_paths, verified_folder, cb)
             if not streams:
@@ -427,10 +432,10 @@ def run_pipeline(files, epg_choice, epg_custom, catchup=True, do_test=False, tim
                 if do_test:
                     # FFmpeg-проверка только этого куска, по очереди
                     tester = M3UTester(timeout=timeout, max_workers=workers)
-                    res, st = tester.test_playlists([_chunk_to_tmpfile(verified_folder, ci, chunk)],
+                    res, st = tester.test_playlists([_chunk_to_tmpfile(tmp_folder, ci, chunk)],
                                                     lambda m: cb(base, f"Кусок {ci}/{total_chunks}", m),
                                                     chunk_size=len(chunk) + 1,
-                                                    save_dir=Path(verified_folder) / f"_test_{ci:03d}")
+                                                    save_dir=tmp_folder / f"_test_{ci:03d}")
                     if res is None:
                         kept = list(chunk)
                     else:
@@ -467,6 +472,10 @@ def run_pipeline(files, epg_choice, epg_custom, catchup=True, do_test=False, tim
             lines = apply_header(lines, epg, catchup)
             result_file = out_folder / "final_filtered.m3u"
             result_file.write_text("".join(lines), encoding="utf-8")
+            # временная папка больше не нужна — удаляем
+            import shutil
+            shutil.rmtree(tmp_folder, ignore_errors=True)
+            cb(1.0, "Готово", f"🧹 Временная папка удалена; куски сохранены в: {verified_folder}")
             holder["result"] = (str(result_file), str(merged_path), total_chunks,
                                 len(streams), len(final), foreign_n, summary)
         except Exception as e:
@@ -509,14 +518,14 @@ def run_pipeline(files, epg_choice, epg_custom, catchup=True, do_test=False, tim
     yield [result_file, merged_path], text
 
 
-def _chunk_to_tmpfile(verified_folder, idx, chunk):
+def _chunk_to_tmpfile(tmp_folder, idx, chunk):
     """Записывает кусок во временный m3u для FFmpeg-проверки, возвращает путь."""
     lines = ["#EXTM3U\n"]
     for s in chunk:
         lines.append(s["info"] + "\n")
         lines.extend(x + "\n" for x in s.get("extra", []))
         lines.append(s["url"] + "\n")
-    path = Path(verified_folder) / f"_in_{idx:03d}.m3u"
+    path = Path(tmp_folder) / f"_in_{idx:03d}.m3u"
     path.write_text("".join(lines), encoding="utf-8")
     return str(path)
 
@@ -929,6 +938,33 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft(), head=EPG_HEAD_HTML) as
                 tester_function,
                 inputs=[tester_files, tester_timeout, tester_workers, tester_epg, tester_epg_custom, tester_catchup],
                 outputs=[tester_output, tester_stats]
+            )
+
+        # TAB: Фильтр-конвейер (нарезка на куски < 300 каналов)
+        with gr.Tab("🧩 Фильтр-конвейер"):
+            gr.Markdown("### Полный конвейер фильтрации")
+            with gr.Row():
+                with gr.Column():
+                    pipe_files = gr.File(label="M3U файлы", file_count="multiple", file_types=[".m3u", ".m3u8"])
+                    pipe_test = gr.Checkbox(label="FFmpeg-проверка потоков (иначе — только базовая фильтрация)", value=False)
+                    pipe_timeout = gr.Slider(minimum=3, maximum=20, value=8, step=1, label="Timeout (секунды)")
+                    pipe_workers = gr.Slider(minimum=5, maximum=50, value=15, step=5, label="Параллельных FFmpeg-потоков")
+                    pipe_foreign = gr.Checkbox(label="Отсеять иностранные каналы", value=True)
+                    pipe_topics = gr.Checkbox(label="Разбить на группы по темам", value=True)
+                    with gr.Row():
+                        pipe_epg = _epg_dropdown()
+                        pipe_epg_custom = gr.Textbox(label="Своя EPG ссылка", value="", placeholder="своя ссылка xml.gz")
+                    pipe_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
+                    pipe_btn = gr.Button("🚀 Запустить конвейер", variant="primary")
+                with gr.Column():
+                    pipe_output = gr.File(label="Результат (итоговый + объединённый файл кусков)", file_count="multiple")
+                    pipe_stats = gr.Textbox(label="Ход работы / Статистика", lines=16)
+
+            pipe_btn.click(
+                run_pipeline,
+                inputs=[pipe_files, pipe_epg, pipe_epg_custom, pipe_catchup, pipe_test,
+                        pipe_timeout, pipe_workers, pipe_foreign, pipe_topics],
+                outputs=[pipe_output, pipe_stats]
             )
         
         # TAB: EPG
