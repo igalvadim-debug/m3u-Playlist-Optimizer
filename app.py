@@ -16,14 +16,21 @@ from modules.tester import M3UTester
 from modules.converter import M3UConverter
 from modules.merger import M3UMerger
 from modules.llm_filter import LLMFilter, LLM_PORT
-from modules.header import DEFAULT_EPG, apply_header
-from modules.m3u_utils import parse_m3u, url_key, set_group
+from modules.header import DEFAULT_EPG, apply_header, EPG_CHOICES, EPG_TITLES, epg_from_choice
+from modules.m3u_utils import parse_m3u, url_key, set_group, split_extinf
 from modules.organizer import Organizer
 
 
 OUTPUT_DIR = Path(os.environ.get("M3UGENIUS_OUTPUT_DIR", "outputs"))
 FONT_PATH = Path("ttf/DejaVuSans.ttf")
 SERVER_PORT = int(os.environ.get("M3UGENIUS_PORT", "7860"))
+
+# Подсказки при наведении мыши (title-атрибут) для выпадающих списков EPG.
+# Текст пояснений показывается ТОЛЬКО при наведении, без видимых подписей.
+EPG_DROPDOWN_TIP = ("Выберите готовый EPG-источник из списка или вставьте свою ссылку.\n\n"
+                    + EPG_TITLES)
+EPG_MULTI_TIP = ("Можно выбрать несколько источников (или вписать свою ссылку).\n\n"
+                 + EPG_TITLES)
 
 
 def create_output_folder():
@@ -34,15 +41,60 @@ def create_output_folder():
     return folder
 
 
+def create_verified_folder():
+    """Временная папка с проверенными каналами: название = день недели + дата (+время)"""
+    folder = OUTPUT_DIR / datetime.now().strftime("Проверенные_%A_%d.%m.%Y_%H-%M-%S")
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
 def _paths(files):
     """Пути загруженных файлов (работает и со строками, и с объектами с .name)"""
     return [getattr(f, "name", f) for f in files]
 
 
-def cleaner_function(files, blocklist_text, epg_url="", catchup=True):
+def _resolve_epg(dropdown, custom):
+    """Итоговая EPG-ссылка: выбранный источник(ы) из списка + своё поле."""
+    parts = []
+    dd = dropdown if isinstance(dropdown, list) else ([dropdown] if dropdown else [])
+    for d in dd:
+        s = str(d).strip()
+        if s:
+            parts.append(s)
+    c = (custom or "").strip()
+    if c:
+        parts.append(c)
+    return epg_from_choice(parts) if parts else ""
+
+
+def _epg_dropdown(label="EPG ссылка (url-tvg)", multi=False, value=None):
+    """Выпадающий список готовых EPG-источников; свой URL можно ввести прямо здесь."""
+    return gr.Dropdown(label=label, choices=EPG_CHOICES,
+                       value=value if not multi else (value or []),
+                       multiselect=multi, allow_custom_value=True, interactive=True,
+                       elem_classes=["epg-tip"], visible=True)
+
+
+def _epg_titles_js(text):
+    """JS: всплывающий текст-пояснение при наведении мыши на выпадающий список EPG.
+    Никаких видимых подписей — только tooltip (атрибут title)."""
+    payload = json.dumps({"tip": text})
+    return f"""
+    () => {{
+        const d = {payload};
+        document.querySelectorAll('.epg-tip').forEach(el => {{
+            el.setAttribute('title', d.tip);
+            el.querySelectorAll('input, button, [role="combobox"]').forEach(x => x.setAttribute('title', d.tip));
+        }});
+    }}
+    """
+
+
+def cleaner_function(files, blocklist_text, epg_choice=None, epg_custom="", catchup=True):
     """Очистка и объединение M3U файлов"""
     if not files:
         return None, "Ошибка: не выбраны файлы"
+    epg_url = _resolve_epg(epg_choice, epg_custom)
     
     output_folder = create_output_folder()
     cleaner = M3UCleaner()
@@ -76,24 +128,27 @@ def cleaner_function(files, blocklist_text, epg_url="", catchup=True):
     return str(output_file), stats_text
 
 
-def tester_function(files, timeout, workers, epg_url="", catchup=True):
-    """Тестирование потоков"""
+def tester_function(files, timeout, workers, epg_choice=None, epg_custom="", catchup=True):
+    """Тестирование потоков (список нарезается на куски < 300 каналов)"""
     if not files:
         return None, "Ошибка: не выбраны файлы"
-    
+    epg_url = _resolve_epg(epg_choice, epg_custom)
+
     output_folder = create_output_folder()
+    verified_folder = create_verified_folder()
     tester = M3UTester(timeout=timeout, max_workers=workers)
-    
+
     progress_log = []
     def log_progress(msg):
         progress_log.append(msg)
-    
+
     file_paths = [f.name for f in files]
-    result, stats = tester.test_playlists(file_paths, log_progress)
-    
+    result, stats = tester.test_playlists(file_paths, log_progress,
+                                          chunk_size=CHUNK_SIZE, save_dir=verified_folder)
+
     if result is None:
         return None, f"Ошибка: {stats.get('error', 'Неизвестная ошибка')}"
-    
+
     result = apply_header(result, epg_url, catchup)
     output_file = output_folder / "tested_working.m3u"
     with open(output_file, 'w', encoding='utf-8') as f:
@@ -108,17 +163,273 @@ def tester_function(files, timeout, workers, epg_url="", catchup=True):
 - Дубликатов удалено: {stats['streams_duplicate']}
 
 💾 Сохранено:
-- Рабочие: {output_file}
+- Единый файл рабочих: {output_file}
+- Папка с проверенными каналами (куски): {verified_folder}
 """
-    
+
     result_files = [str(output_file)]
     return result_files, stats_text
 
 
-def epg_function(files, sources, epg_url="", catchup=True):
+# ---------------------------------------------------------------------------
+# Конвейер фильтрации: временная папка -> куски < 300 каналов -> прогон по
+# очереди -> результаты в папке проверенных -> объединение -> отсев
+# иностранных -> разбивка на группы по темам
+# ---------------------------------------------------------------------------
+CHUNK_SIZE = 280  # максимум каналов в одном куске (всегда меньше 300)
+
+
+def _load_streams_chunked(file_paths, verified_folder, log):
+    """Читает плейлисты и нарезает список на куски < 300 каналов."""
+    seen = set()
+    streams = []
+    dups = 0
+    for p in file_paths:
+        log(0.0, "Чтение плейлистов...", f"📂 Читаю: {Path(p).name}")
+        _, entries = parse_m3u(p)
+        for e in entries:
+            key = url_key(e["url"])
+            if key in seen:
+                dups += 1
+                continue
+            seen.add(key)
+            info = set_group(e["info"], e["group"]) if e["group"] else e["info"]
+            streams.append({"info": info, "url": e["url"], "extra": e["extra"]})
+    chunks = [streams[i:i + CHUNK_SIZE] for i in range(0, len(streams), CHUNK_SIZE)]
+    log(0.0, "Нарезка списка",
+        f"🔍 Каналов: {len(streams)} (дубликатов пропущено: {dups}). "
+        f"Нарезаю на {len(chunks)} кусок(ов) по ≤{CHUNK_SIZE}. "
+        f"Папка проверенных: {verified_folder}")
+    return streams, chunks
+
+
+def _save_chunk_result(verified_folder, idx, subset, kept):
+    """Сохраняет результат куска в папку с проверенными каналами."""
+    lines = ["#EXTM3U\n", f"# Кусок {idx}: каналов {len(subset)}, оставлено {len(kept)}\n"]
+    kept_ids = {id(s) for s in kept}
+    for s in subset:
+        mark = "OK" if id(s) in kept_ids else "FAIL"
+        lines.append(f"# [{mark}]\n")
+        lines.append(s["info"] + "\n")
+        lines.extend(x + "\n" for x in s.get("extra", []))
+        lines.append(s["url"] + "\n")
+    path = Path(verified_folder) / f"chunk_{idx:03d}.m3u"
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
+
+
+def _merge_chunks(verified_folder):
+    """В конце объединяет все сохранённые куски в один файл merged_all.m3u."""
+    from modules.m3u_utils import entry_to_lines
+    merged = ["#EXTM3U\n", "# Объединённый результат всех кусков\n"]
+    urls_seen = set()
+    for cf in sorted(Path(verified_folder).glob("chunk_*.m3u")):
+        _, entries = parse_m3u(str(cf))
+        for e in entries:
+            k = url_key(e["url"])
+            if k in urls_seen:
+                continue
+            urls_seen.add(k)
+            merged.extend(entry_to_lines(e))
+    out = Path(verified_folder) / "merged_all.m3u"
+    out.write_text("".join(merged), encoding="utf-8")
+    return out, len(urls_seen)
+
+
+def _filter_chunk(streams):
+    """Фильтрация одного куска: убираем пустые адреса и каналы без имени."""
+    keep = []
+    for s in streams:
+        try:
+            _, _, name = split_extinf(s["info"])
+        except Exception:
+            name = ""
+        url = (s.get("url") or "").strip()
+        if not url or not name.strip():
+            continue
+        keep.append(s)
+    return keep
+
+
+def _split_foreign_keep(streams):
+    """Отсеивает иностранные каналы (правила Organizer'а, без обращений к модели)."""
+    from modules.organizer import Organizer
+    ru, foreign = [], []
+    for s in streams:
+        e = {"attrs": {}, "name": "", "group": ""}
+        try:
+            _, attrs, name = split_extinf(s["info"])
+            e["attrs"], e["name"] = attrs, name or ""
+            e["group"] = (attrs.get("group-title") or "").strip()
+        except Exception:
+            pass
+        score = Organizer._lang_score(e)
+        (ru if score >= -1 else foreign).append(s)
+    return ru, foreign
+
+
+def _group_by_topics(streams):
+    """Разбивает каналы на группы по темам (правила Organizer'а, без модели)."""
+    from modules.organizer import Organizer, CATS
+    groups_map = {}
+    for s in streams:
+        _, attrs, name = split_extinf(s["info"])
+        e = {"attrs": attrs, "name": name or "",
+             "group": (attrs.get("group-title") or "").strip()}
+        cat = Organizer._rule_category(e)
+        if cat == "other":
+            g = e["group"] or "Разное"
+        else:
+            emoji, title, _, _ = CATS[cat]
+            g = f"{emoji} {title}"
+        groups_map.setdefault(g, []).append(s)
+    ordered = sorted(groups_map.items(), key=lambda kv: kv[0])
+    lines = ["#EXTM3U\n"]
+    summary = []
+    for gname, part in ordered:
+        summary.append((gname, len(part)))
+        for s in part:
+            lines.append(set_group(s["info"], gname) + "\n")
+            lines.extend(x + "\n" for x in s.get("extra", []))
+            lines.append(s["url"] + "\n")
+    return lines, summary
+
+
+def run_pipeline(files, epg_choice, epg_custom, catchup=True, do_test=False, timeout=8, workers=15,
+                 remove_foreign=True, group_topics=True, progress=gr.Progress()):
+    """Полный конвейер фильтрации: временная папка с проверенными каналами →
+    нарезка списка на куски < 300 каналов → прогон кусков по очереди (при
+    включённой FFmpeg-проверке) → сохранение каждого результата в папке
+    проверенных → объединение всего в один файл → отсев иностранных каналов →
+    разбивка на группы по темам."""
+    if not files:
+        yield None, "Ошибка: не выбраны файлы"
+        return
+
+    epg = _resolve_epg(epg_choice, epg_custom)
+    file_paths = _paths(files)
+    events = queue.Queue()
+    holder = {}
+
+    def cb(frac, desc, line=None):
+        events.put(("p", frac, desc, line))
+
+    def worker():
+        try:
+            verified_folder = create_verified_folder()
+            streams, chunks = _load_streams_chunked(file_paths, verified_folder, cb)
+            if not streams:
+                raise RuntimeError("В файлах нет каналов")
+
+            kept_all = []
+            total_chunks = len(chunks)
+            for ci, chunk in enumerate(chunks, start=1):
+                base = ci / (total_chunks + 2.0)
+                cb(base, f"Кусок {ci}/{total_chunks}",
+                   f"🧩 Прогоняю кусок {ci}/{total_chunks}: каналов {len(chunk)}")
+                if do_test:
+                    # FFmpeg-проверка только этого куска, по очереди
+                    tester = M3UTester(timeout=timeout, max_workers=workers)
+                    res, st = tester.test_playlists([_chunk_to_tmpfile(verified_folder, ci, chunk)],
+                                                    lambda m: cb(base, f"Кусок {ci}/{total_chunks}", m),
+                                                    chunk_size=len(chunk) + 1,
+                                                    save_dir=Path(verified_folder) / f"_test_{ci:03d}")
+                    if res is None:
+                        kept = list(chunk)
+                    else:
+                        ok_urls = {s["url"] for s in tester.working_streams}
+                        kept = [s for s in chunk if s["url"] in ok_urls]
+                else:
+                    kept = _filter_chunk(chunk)
+                kept_all.extend(kept)
+                _save_chunk_result(verified_folder, ci, chunk, kept)
+
+            merged_path, merged_count = _merge_chunks(verified_folder)
+            cb(0.75, "Объединение кусков",
+               f"🔗 Объединил {total_chunks} кусков в {merged_path.name}: каналов {merged_count}")
+
+            final = kept_all
+            foreign_n = 0
+            if remove_foreign:
+                ru, foreign = _split_foreign_keep(final)
+                foreign_n = len(foreign)
+                final = ru
+                cb(0.9, "Отсев иностранных",
+                   f"🌍 Иностранных отсеяно: {foreign_n}, осталось: {len(final)}")
+
+            out_folder = create_output_folder()
+            if group_topics:
+                lines, summary = _group_by_topics(final)
+            else:
+                lines = ["#EXTM3U\n"]
+                for s in final:
+                    lines.append(s["info"] + "\n")
+                    lines.extend(x + "\n" for x in s.get("extra", []))
+                    lines.append(s["url"] + "\n")
+                summary = []
+            lines = apply_header(lines, epg, catchup)
+            result_file = out_folder / "final_filtered.m3u"
+            result_file.write_text("".join(lines), encoding="utf-8")
+            holder["result"] = (str(result_file), str(merged_path), total_chunks,
+                                len(streams), len(final), foreign_n, summary)
+        except Exception as e:
+            holder["error"] = str(e)
+        finally:
+            events.put(("done",))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    log_lines = []
+    while True:
+        try:
+            ev = events.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if ev[0] == "done":
+            break
+        _, frac, desc, line = ev
+        progress(max(0.0, min(1.0, frac)), desc=desc)
+        if line:
+            log_lines.append(line)
+            yield None, "\n".join(log_lines[-200:])
+
+    if "error" in holder:
+        yield None, "\n".join(log_lines[-200:]) + f"\n\n❌ Ошибка: {holder['error']}"
+        return
+
+    result_file, merged_path, nchunks, total, final_n, foreign_n, summary = holder["result"]
+    text = ("✅ Готово!\n\n"
+            f"📊 Конвейер:\n"
+            f"- Каналов всего: {total}\n"
+            f"- Кусков прогнано (< 300 каналов): {nchunks}\n"
+            f"- Объединённый файл кусков: {merged_path}\n"
+            f"- Иностранных отсеяно: {foreign_n}\n"
+            f"- Итоговых каналов: {final_n}\n"
+            f"- 💾 Результат: {result_file}\n")
+    if summary:
+        text += "\n🗂 Группы по темам:\n" + "\n".join(f"  • {g} — {n}" for g, n in summary[:60])
+    yield [result_file, merged_path], text
+
+
+def _chunk_to_tmpfile(verified_folder, idx, chunk):
+    """Записывает кусок во временный m3u для FFmpeg-проверки, возвращает путь."""
+    lines = ["#EXTM3U\n"]
+    for s in chunk:
+        lines.append(s["info"] + "\n")
+        lines.extend(x + "\n" for x in s.get("extra", []))
+        lines.append(s["url"] + "\n")
+    path = Path(verified_folder) / f"_in_{idx:03d}.m3u"
+    path.write_text("".join(lines), encoding="utf-8")
+    return str(path)
+
+
+def epg_function(files, sources_choice=None, sources_custom="", epg_choice=None, epg_custom="", catchup=True):
     """EPG под выбранные каналы: скачать XMLTV, отфильтровать, вписать tvg-id"""
     if not files:
         return None, "Ошибка: не выбраны файлы"
+    sources = _resolve_epg(sources_choice, sources_custom)
+    epg_url = _resolve_epg(epg_choice, epg_custom)
 
     from modules.epg_builder import EpgBuilder
     output_folder = create_output_folder()
@@ -268,11 +579,12 @@ def merger_undo(state):
     return _merger_view(state, "Нечего отменять")
 
 
-def merger_save(state, epg_field, catchup):
+def merger_save(state, epg_choice=None, epg_custom="", catchup=True):
     """Сохраняет итоговый плейлист. В шапке только одна ссылка EPG"""
     if not state or not state["groups"]:
         return None, "Нет данных: сначала склейте плейлисты"
-    epg = _merger.pick_epg(state, epg_field)
+    chosen = _resolve_epg(epg_choice, epg_custom)
+    epg = chosen or _merger.pick_epg(state, "")
     lines = apply_header(_merger.write_lines(state), epg, catchup, single=True)
     output_folder = create_output_folder()
     output_file = output_folder / "merged.m3u"
@@ -327,11 +639,13 @@ def _groups_text(groups, limit=60):
 
 
 def llm_filter_function(files, timeout, ffmpeg_workers, llm_workers, frames, remove_no_frame,
-                        sort_enabled, sort_only, epg_url="", catchup=True, progress=gr.Progress()):
+                        sort_enabled, sort_only, epg_choice=None, epg_custom="", catchup=True,
+                        progress=gr.Progress()):
     """FFmpeg-отсев + проверка кадров моделью (удаление заглушек) + умная сортировка по группам"""
     if not files:
         yield None, "Ошибка: не выбраны файлы"
         return
+    epg_url = _resolve_epg(epg_choice, epg_custom)
 
     sort_enabled = bool(sort_enabled or sort_only)
     file_paths = _paths(files)
@@ -482,7 +796,9 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
                 with gr.Column():
                     cleaner_files = gr.File(label="M3U файлы", file_count="multiple", file_types=[".m3u", ".m3u8"])
                     cleaner_blocklist = gr.Textbox(label="Блоклист (один домен/URL на строку)", lines=5, placeholder="example.com\nbad-domain.net")
-                    cleaner_epg = gr.Textbox(label="EPG ссылка (url-tvg)", value=DEFAULT_EPG, placeholder="https://.../epg.xml.gz (несколько через запятую; пусто = без EPG)")
+                    with gr.Row():
+                        cleaner_epg = _epg_dropdown()
+                        cleaner_epg_custom = gr.Textbox(label="Своя EPG ссылка", value="", placeholder="своя ссылка xml.gz")
                     cleaner_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
                     cleaner_btn = gr.Button("🚀 Запустить очистку", variant="primary")
                 with gr.Column():
@@ -491,7 +807,7 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             
             cleaner_btn.click(
                 cleaner_function,
-                inputs=[cleaner_files, cleaner_blocklist, cleaner_epg, cleaner_catchup],
+                inputs=[cleaner_files, cleaner_blocklist, cleaner_epg, cleaner_epg_custom, cleaner_catchup],
                 outputs=[cleaner_output, cleaner_stats]
             )
         
@@ -503,7 +819,9 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
                     tester_files = gr.File(label="M3U файлы", file_count="multiple", file_types=[".m3u", ".m3u8"])
                     tester_timeout = gr.Slider(minimum=3, maximum=20, value=8, step=1, label="Timeout (секунды)")
                     tester_workers = gr.Slider(minimum=5, maximum=50, value=15, step=5, label="Параллельных потоков")
-                    tester_epg = gr.Textbox(label="EPG ссылка (url-tvg)", value=DEFAULT_EPG, placeholder="https://.../epg.xml.gz (несколько через запятую; пусто = без EPG)")
+                    with gr.Row():
+                        tester_epg = _epg_dropdown()
+                        tester_epg_custom = gr.Textbox(label="Своя EPG ссылка", value="", placeholder="своя ссылка xml.gz")
                     tester_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
                     tester_btn = gr.Button("🚀 Запустить тестирование", variant="primary")
                 with gr.Column():
@@ -512,7 +830,7 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             
             tester_btn.click(
                 tester_function,
-                inputs=[tester_files, tester_timeout, tester_workers, tester_epg, tester_catchup],
+                inputs=[tester_files, tester_timeout, tester_workers, tester_epg, tester_epg_custom, tester_catchup],
                 outputs=[tester_output, tester_stats]
             )
         
@@ -522,11 +840,15 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             with gr.Row():
                 with gr.Column():
                     epg_files = gr.File(label="M3U файлы", file_count="multiple", file_types=[".m3u", ".m3u8"])
-                    epg_sources = gr.Textbox(label="Ссылки на EPG (xml / xml.gz), по одной на строку", lines=4,
-                                             value="https://files.caribo.net/epg/epg.xml.gz",
-                                             placeholder="https://.../epg.xml.gz")
-                    epg_epgurl = gr.Textbox(label="EPG ссылка в шапку плейлиста (url-tvg)", value="",
-                                            placeholder="пусто = впишу ссылки источников; или укажи URL с epg_filtered.xml.gz")
+                    with gr.Row():
+                        epg_sources = _epg_dropdown("Источники EPG (xml / xml.gz)", multi=True,
+                                                    value=["IPTVx.one (категории, логотипы, ТБ ГИД)"])
+                        epg_sources_custom = gr.Textbox(label="Своя ссылка EPG", lines=2, value="",
+                                                        placeholder="можно несколько, по одной на строку")
+                    with gr.Row():
+                        epg_epgurl = _epg_dropdown("EPG ссылка в шапку плейлиста (url-tvg)")
+                        epg_epgurl_custom = gr.Textbox(label="Своя EPG ссылка в шапку", value="",
+                                                       placeholder="пусто = впишу ссылки источников")
                     epg_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
                     epg_btn = gr.Button("🚀 Собрать EPG", variant="primary")
                 with gr.Column():
@@ -535,7 +857,7 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
 
             epg_btn.click(
                 epg_function,
-                inputs=[epg_files, epg_sources, epg_epgurl, epg_catchup],
+                inputs=[epg_files, epg_sources, epg_sources_custom, epg_epgurl, epg_epgurl_custom, epg_catchup],
                 outputs=[epg_output, epg_stats]
             )
 
@@ -582,7 +904,9 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
                     merger_merge_btn = gr.Button("🔗 Объединить выбранные", variant="primary")
 
                     gr.Markdown("#### Сохранение")
-                    merger_epg = gr.Textbox(label="EPG ссылка (url-tvg)", value="", placeholder="пусто = возьму ссылку из первого плейлиста; если ссылок несколько, берётся первая")
+                    with gr.Row():
+                        merger_epg = _epg_dropdown("EPG ссылка (url-tvg)")
+                        merger_epg_custom = gr.Textbox(label="Своя EPG ссылка", value="", placeholder="пусто = возьму ссылку из первого плейлиста")
                     merger_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
                     merger_save_btn = gr.Button("💾 Сохранить плейлист", variant="primary")
                     merger_output = gr.File(label="Результат")
@@ -595,7 +919,7 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             merger_undo_btn.click(merger_undo, inputs=[merger_state], outputs=_view_outputs)
             merger_save_btn.click(
                 merger_save,
-                inputs=[merger_state, merger_epg, merger_catchup],
+                inputs=[merger_state, merger_epg, merger_epg_custom, merger_catchup],
                 outputs=[merger_output, merger_status]
             )
 
@@ -614,7 +938,9 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
                     llm_remove_noframe = gr.Checkbox(label="Удалять каналы, у которых не удалось получить кадр", value=False)
                     llm_sort = gr.Checkbox(label="🗂 Отсортировать: русскоязычные по темам (группы по 40–50 каналов), нерусскоязычные в отдельный файл", value=False)
                     llm_sort_only = gr.Checkbox(label="Только сортировка, без проверки потоков (быстро, для уже очищенного плейлиста)", value=False)
-                    llm_epg = gr.Textbox(label="EPG ссылка (url-tvg)", value=DEFAULT_EPG, placeholder="https://.../epg.xml.gz (несколько через запятую; пусто = без EPG)")
+                    with gr.Row():
+                        llm_epg = _epg_dropdown()
+                        llm_epg_custom = gr.Textbox(label="Своя EPG ссылка", value="", placeholder="своя ссылка xml.gz")
                     llm_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
                     llm_btn = gr.Button("🚀 Запустить", variant="primary")
                 with gr.Column():
@@ -624,7 +950,7 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
             llm_btn.click(
                 llm_filter_function,
                 inputs=[llm_files, llm_timeout, llm_ffmpeg_workers, llm_workers, llm_frames, llm_remove_noframe,
-                        llm_sort, llm_sort_only, llm_epg, llm_catchup],
+                        llm_sort, llm_sort_only, llm_epg, llm_epg_custom, llm_catchup],
                 outputs=[llm_output, llm_stats]
             )
 
