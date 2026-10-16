@@ -7,8 +7,9 @@ import os
 import re
 from pathlib import Path
 from collections import defaultdict
+from xml.sax.saxutils import escape
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.ttfonts import TTFont, TTFError
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -28,9 +29,64 @@ GENRE_KEYWORDS = {
 
 class M3UConverter:
     def __init__(self, font_path):
+        """Register a PDF font globally under the name ``DejaVu``.
+
+        If font_path is missing, select the first TTF in its directory with
+        glyphs for the Russian alphabet, including Yo, and update self.font_path.
+        If it exists, search system font directories for a font whose best
+        character map contains Cyrillic A and lowercase Ya instead.
+
+        Raise FileNotFoundError if no suitable neighboring font is found, or
+        RuntimeError if the system search fails. Invalid neighboring TTFs are
+        skipped; other loading or registration errors in that branch propagate.
+        System font errors are caught while the search continues.
+        """
         self.font_path = font_path
-        if os.path.isfile(font_path):
-            pdfmetrics.registerFont(TTFont('DejaVu', font_path))
+        # Если указанного шрифта нет, ищем рядом TTF с поддержкой русского алфавита.
+        if not os.path.isfile(font_path):
+            font_dir = Path(font_path).parent
+            candidates = sorted(font_dir.glob("*.ttf")) if font_dir.is_dir() else []
+            required = set(range(0x0410, 0x0450)) | {0x0401, 0x0451}
+            for candidate in candidates:
+                try:
+                    font = TTFont('DejaVu', str(candidate))
+                except TTFError:
+                    continue
+                if all(font.face.charToGlyph.get(code) for code in required):
+                    self.font_path = str(candidate)
+                    pdfmetrics.registerFont(font)
+                    break
+            else:
+                raise FileNotFoundError(
+                    f"Не найден TTF-шрифт с поддержкой кириллицы. "
+                    f"Установите DejaVuSans.ttf в {font_dir} или укажите путь к шрифту.")
+        else:
+            # Встроенный Vera.ttf НЕ содержит кириллицы, а метки в build_pdf_content()
+            # русские — регистрировать его под именем 'DejaVu' нельзя.
+            # Ищем любой TTF с кириллицей в системных каталогах.
+            registered = False
+            sys_dirs = [Path('/usr/share/fonts'), Path('/usr/local/share/fonts'), Path.home() / '.fonts']
+            for d in sys_dirs:
+                if not d.is_dir():
+                    continue
+                for tf in sorted(d.rglob('*.ttf')):
+                    try:
+                        pdfmetrics.registerFont(TTFont('DejaVu', str(tf)))
+                        # проверка кириллицы через cmap
+                        from fontTools.ttLib import TTFont as _FTT
+                        cmap = _FTT(str(tf)).getBestCmap()
+                        if 0x0410 in cmap and 0x044F in cmap:
+                            registered = True
+                            break
+                    except Exception:
+                        continue
+                if registered:
+                    break
+            if not registered:
+                raise RuntimeError(
+                    "Не найден TTF-шрифт с поддержкой кириллицы для генерации PDF. "
+                    "Положите DejaVuSans.ttf в каталог ttf/ или установите системный кириллический шрифт."
+                )
     
     def extract_group_and_channel(self, line):
         if not line.startswith('#EXTINF:'):
@@ -97,7 +153,7 @@ class M3UConverter:
         
         story = []
         for filename, groups in all_data.items():
-            story.append(Paragraph(f"📁 {filename}", title_style))
+            story.append(Paragraph(f"📁 {escape(filename)}", title_style))
             story.append(Spacer(1, 12))
             if not groups:
                 story.append(Paragraph("Нет каналов", channel_style))
@@ -106,14 +162,19 @@ class M3UConverter:
             for group_name in sorted(groups.keys()):
                 emoji = self.find_emoji_for_group(group_name)
                 display = f"{emoji} {group_name}" if emoji else group_name
-                story.append(Paragraph(f"🔹 {display}", group_style))
+                story.append(Paragraph(f"🔹 {escape(display)}", group_style))
                 for ch in sorted(set(groups[group_name])):
-                    story.append(Paragraph(ch, channel_style))
+                    story.append(Paragraph(escape(ch), channel_style))
                 story.append(Spacer(1, 6))
             story.append(Spacer(1, 24))
         return story
     
     def build_html_content(self, all_data):
+        """Return an HTML document from a filename -> group -> channel list mapping.
+
+        Labels are escaped as text. Files retain input order; groups and unique
+        channel names are sorted. Empty files receive a no-channels message.
+        """
         html = '''<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -133,33 +194,43 @@ class M3UConverter:
     <h1>📺 Playlist Summary</h1>
 '''
         for filename, groups in all_data.items():
-            html += f'\n    <div class="file">\n        <h2>📁 {filename}</h2>\n'
+            html += f'\n    <div class="file">\n        <h2>📁 {escape(filename)}</h2>\n'
             if not groups:
                 html += '        <p>Нет каналов</p>\n'
             else:
                 for group_name in sorted(groups.keys()):
                     emoji = self.find_emoji_for_group(group_name)
                     display = f"{emoji} {group_name}" if emoji else group_name
-                    html += f'        <div class="group">\n            <div class="group-name">🔹 {display}</div>\n'
+                    html += f'        <div class="group">\n            <div class="group-name">🔹 {escape(display)}</div>\n'
                     for ch in sorted(set(groups[group_name])):
-                        html += f'            <div class="channel">{ch}</div>\n'
+                        html += f'            <div class="channel">{escape(ch)}</div>\n'
                     html += '        </div>\n'
             html += '    </div>\n'
         html += '</body>\n</html>'
         return html
     
+    @staticmethod
+    def _md_escape(text):
+        """Экранирование Markdown-спецсимволов в незащищённых подписях каналов/групп."""
+        return re.sub(r"([\\`*_\[\]<>|])", r"\\\1", text)
+
     def build_markdown_content(self, all_data):
+        """Return Markdown from a filename -> group -> channel list mapping.
+
+        Labels use _md_escape. Files retain input order; groups and unique
+        channel names are sorted. Empty files receive a no-channels message.
+        """
         md = "# 📺 Playlist Summary\n\n"
         for filename, groups in all_data.items():
-            md += f"## 📁 {filename}\n\n"
+            md += f"## 📁 {self._md_escape(filename)}\n\n"
             if not groups:
                 md += "Нет каналов\n\n"
             else:
                 for group_name in sorted(groups.keys()):
                     emoji = self.find_emoji_for_group(group_name)
                     display = f"{emoji} {group_name}" if emoji else group_name
-                    md += f"### 🔹 {display}\n\n"
+                    md += f"### 🔹 {self._md_escape(display)}\n\n"
                     for ch in sorted(set(groups[group_name])):
-                        md += f"- {ch}\n"
+                        md += f"- {self._md_escape(ch)}\n"
                     md += "\n"
         return md

@@ -10,12 +10,137 @@ EPG Builder
 Всё делается потоково: большие файлы (сотни МБ / ГБ после разжатия) не грузятся в память.
 """
 import gzip
+import http.client
 import io
+import ipaddress
 import re
+import socket
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
 SUFFIXES = ("fullhd", "fhd", "uhd", "4k", "hd", "sd")
+MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024  # потолок на скачанный ответ, защита от OOM/зловредных серверов
+
+
+def _safe_socket_connect(address, timeout=None, source_address=None, *, all_errors=False):
+    """Return a socket connected to the first resolved (host, port) address.
+
+    Reject the host with ValueError if any resolved IP is non-global. Use the
+    validated address directly, with an optional local source_address binding.
+    timeout is in seconds; None blocks, and the socket default sentinel leaves
+    the default unchanged. all_errors is accepted but ignored; no retry occurs.
+    DNS and socket OSErrors propagate, including an empty resolution result;
+    a socket whose connect call fails is closed before the error is re-raised.
+    """
+    host, port = address
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if not infos:
+        raise OSError(f"Cannot determine address of {host!r}")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise ValueError(f"EPG-источник указывает на запрещённый адрес: {ip}")
+    family, stype, proto, _, addr = infos[0]
+    sock = socket.socket(family, stype, proto)
+    if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+        sock.settimeout(timeout)
+    if source_address:
+        sock.bind(source_address)
+    try:
+        sock.connect(addr)
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+class _SafeHTTPConnection(http.client.HTTPConnection):
+    """SSRF-guard только для этого экземпляра: HTTPConnection.connect использует
+    self._create_connection (по умолчанию socket.create_connection)."""
+
+    def __init__(self, *args, **kwargs):
+        """Accept HTTPConnection options and guard this instance's connections."""
+        super().__init__(*args, **kwargs)  # базовый init присваивает self._create_connection
+        self._create_connection = _safe_socket_connect
+
+
+class _SafeHTTPSConnection(http.client.HTTPSConnection):
+    """connect() у HTTPSConnection вызывает super().connect() (HTTPConnection),
+    который берёт self._create_connection — guard наследуется без глобального monkey-patch."""
+
+    def __init__(self, *args, **kwargs):
+        """Accept HTTPSConnection options and guard this instance's connections."""
+        super().__init__(*args, **kwargs)
+        self._create_connection = _safe_socket_connect
+
+
+class _SafeHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        """Open req with guarded HTTP connections, propagating urllib errors."""
+        return self.do_open(_SafeHTTPConnection, req)
+
+
+class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        """Open req with guarded HTTPS connections, propagating urllib errors."""
+        return self.do_open(_SafeHTTPSConnection, req)
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Проверяет каждую цель редиректа через validate_epg_url (в т. ч. смену схемы на ftp и т. п.)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Validate newurl before delegating redirect handling to urllib.
+
+        Return urllib's redirected request or None. Raise HTTPError for a
+        rejected target; validation and urllib redirect errors propagate.
+        """
+        reason = validate_epg_url(newurl)
+        if reason:
+            raise urllib.error.HTTPError(req.full_url, code, f"редирект запрещён: {reason}", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_SafeHTTPHandler(), _SafeHTTPSHandler(), _SafeRedirectHandler())
+
+
+def validate_epg_url(url):
+    """Return a rejection reason, or None for an HTTP(S) URL with global IPs.
+
+    Check a literal IP or every current DNS answer. Missing hosts, empty DNS
+    answers, DNS lookup failures, and ValueErrors from parsing are returned as
+    reasons. Other resolver OSErrors propagate. This check does not connect;
+    the connection guard validates DNS again when opening a socket.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "некорректный URL"
+    if parsed.scheme not in ("http", "https"):
+        return f"схема '{parsed.scheme}' запрещена (только http/https)"
+    host = parsed.hostname
+    if not host:
+        return "в URL нет хоста"
+    try:
+        # если хост — это IP, проверяем сразу; иначе резолвим и проверяем все адреса
+        try:
+            ips = [ipaddress.ip_address(host)]
+        except ValueError:
+            try:
+                infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80),
+                                           0, socket.SOCK_STREAM)
+            except socket.gaierror:
+                return f"не удалось разрешить хост '{host}'"
+            ips = [ipaddress.ip_address(i[4][0]) for i in infos]
+        if not ips:
+            return f"хост '{host}' не имеет адресов"
+        for ip in ips:
+            if not ip.is_global:
+                return f"хост '{host}' указывает на запрещённый адрес {ip} (локальная сеть/loopback)"
+    except ValueError as e:
+        return str(e)
+    return None
 
 
 def norm(name):
@@ -61,6 +186,56 @@ def add_tvgid(line, tvg_id):
         rest = re.sub(r'tvg-id="[^"]*"', 'tvg-id="%s"' % tvg_id, rest, count=1)
         return "#EXTINF:" + dur + rest
     return "#EXTINF:" + dur + ' tvg-id="%s"' % tvg_id + rest
+
+
+class _LimitedRead:
+    """File-like обёртка: отдаёт не более limit байт, дальше — пустой поток (защита от OOM)."""
+
+    def __init__(self, stream, limit):
+        """Wrap a binary stream with a total byte budget of int(limit).
+
+        A nonpositive budget yields an empty stream. Errors converting limit
+        to an integer propagate.
+        """
+        self._s = stream
+        self._left = int(limit)
+
+    def read(self, n=-1):
+        """Read at most n bytes within the remaining total budget.
+
+        None or a negative n requests the remaining budget. Return empty bytes
+        once exhausted; underlying read errors propagate.
+        """
+        if self._left <= 0:
+            return b""
+        if n is None or n < 0:
+            data = self._s.read(self._left)
+        else:
+            data = self._s.read(min(n, self._left))
+        self._left -= len(data)
+        return data
+
+    def readline(self, limit=-1):
+        """Read through a newline or EOF within the remaining byte budget.
+
+        A negative limit adds no line limit. A nonnegative limit caps the line,
+        except that zero still attempts to read one byte. Read errors propagate.
+        """
+        # для совместимости с gzip.GzipFile(fileobj=...), который читает заголовок построчно
+        chunk = self.read(1)
+        line = chunk
+        while chunk and chunk != b"\n":
+            if limit >= 0 and len(line) >= limit:
+                break
+            chunk = self.read(1)
+            line += chunk
+        return line
+
+    def seek(self, *args):
+        """Always raise io.UnsupportedOperation because seeking is unsupported."""
+        raise io.UnsupportedOperation("seek")
+
+    seekable = lambda self: False
 
 
 class _Prepend:
@@ -120,12 +295,23 @@ class EpgBuilder:
     # ---------- поток ----------
     @staticmethod
     def _open_stream(url, timeout=300):
+        """Open a guarded HTTP(S) response as a binary stream, decoding gzip.
+
+        timeout is the socket timeout in seconds. Both downloaded bytes and
+        decompressed bytes are capped at MAX_DOWNLOAD_BYTES (512 MiB by default);
+        the cap appears as EOF. Gzip is detected by its magic bytes.
+        Connection and URL errors propagate here; read and decompression errors
+        can also propagate when the returned stream is consumed.
+        """
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (m3uGenius)"})
-        resp = urllib.request.urlopen(req, timeout=timeout)
-        head = resp.read(2)
+        resp = _opener.open(req, timeout=timeout)  # SSRF-guard: соединение только с публичными IP
+        # Потолковый лимит объёма скачивания (защита от «бесконечного» ответа / OOM)
+        stream = _LimitedRead(resp, MAX_DOWNLOAD_BYTES)
+        head = stream.read(2)
         if head == b"\x1f\x8b":
-            return gzip.GzipFile(fileobj=_Prepend(head, resp))
-        return _Prepend(head, resp)
+            # лимит применяем и к РАЗЖАТОМУ потоку: gzip-бомбы могут дать ГБ данных из малых файлов
+            return _LimitedRead(gzip.GzipFile(fileobj=_Prepend(head, stream)), MAX_DOWNLOAD_BYTES)
+        return _Prepend(head, stream)
 
     # ---------- фильтрация ----------
     def _filter_into(self, stream, want_norm, name2id, out):
@@ -164,6 +350,18 @@ class EpgBuilder:
         root.clear()
 
     def build(self, m3u_files, source_urls, progress_cb=None):
+        """Return filtered XMLTV bytes and a normalized display-name -> ID mapping.
+
+        Read channel names from M3U paths and process comma- or newline-separated
+        source_urls in order. Unreadable playlists are ignored. Reject invalid
+        sources and record reasons in stats['errors']; download and XML parsing
+        errors are also recorded, retaining any output already collected.
+        Empty inputs still return a tv wrapper and an empty mapping.
+
+        Update this instance's cumulative statistics and call progress_cb with
+        progress messages when supplied. Callback errors and unexpected resolver
+        errors during URL validation propagate.
+        """
         def log(m):
             if progress_cb:
                 progress_cb(m)
@@ -178,6 +376,11 @@ class EpgBuilder:
         out.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<tv>\n')
         for i, u in enumerate(urls):
             self.stats["sources"] += 1
+            reason = validate_epg_url(u)
+            if reason:
+                self.stats["errors"].append(f"{u}: {reason}")
+                log(f"  \u2717 пропущен небезопасный источник [{i + 1}/{len(urls)}] {u}: {reason}")
+                continue
             log(f"Скачиваю/разбираю EPG [{i + 1}/{len(urls)}]: {u}")
             try:
                 stream = self._open_stream(u)
