@@ -24,8 +24,8 @@ class _Dummy:
         return iter([])
 
 gr = types.ModuleType("gradio")
-for name in ["Blocks","Tab","Row","Column","Markdown","File","Textbox","Button","Checkbox",
-             "Slider","Dropdown","CheckboxGroup","State","Progress","JSON","Gallery"]:
+for name in ["Blocks","Tabs","Tab","Row","Column","Markdown","File","Textbox","Button","Checkbox",
+             "Slider","Dropdown","CheckboxGroup","State","Progress","JSON","Gallery","update"]:
     setattr(gr, name, _Dummy)
 gr.themes = _Dummy()
 sys.modules["gradio"] = gr
