@@ -40,11 +40,32 @@ class M3UConverter:
         if os.path.isfile(font_path):
             pdfmetrics.registerFont(TTFont('DejaVu', font_path))
         else:
-            # запасной вариант — встроенный шрифт reportlab (Vera)
-            import reportlab
-            fallback = Path(reportlab.__file__).parent / 'fonts' / 'Vera.ttf'
-            if fallback.is_file():
-                pdfmetrics.registerFont(TTFont('DejaVu', str(fallback)))
+            # Встроенный Vera.ttf НЕ содержит кириллицы, а метки в build_pdf_content()
+            # русские — регистрировать его под именем 'DejaVu' нельзя.
+            # Ищем любой TTF с кириллицей в системных каталогах.
+            registered = False
+            sys_dirs = [Path('/usr/share/fonts'), Path('/usr/local/share/fonts'), Path.home() / '.fonts']
+            for d in sys_dirs:
+                if not d.is_dir():
+                    continue
+                for tf in sorted(d.rglob('*.ttf')):
+                    try:
+                        pdfmetrics.registerFont(TTFont('DejaVu', str(tf)))
+                        # проверка кириллицы через cmap
+                        from fontTools.ttLib import TTFont as _FTT
+                        cmap = _FTT(str(tf)).getBestCmap()
+                        if 0x0410 in cmap and 0x044F in cmap:
+                            registered = True
+                            break
+                    except Exception:
+                        continue
+                if registered:
+                    break
+            if not registered:
+                raise RuntimeError(
+                    "Не найден TTF-шрифт с поддержкой кириллицы для генерации PDF. "
+                    "Положите DejaVuSans.ttf в каталог ttf/ или установите системный кириллический шрифт."
+                )
     
     def extract_group_and_channel(self, line):
         if not line.startswith('#EXTINF:'):

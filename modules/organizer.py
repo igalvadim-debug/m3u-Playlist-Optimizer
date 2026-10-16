@@ -226,23 +226,33 @@ class Organizer:
         score = 0
         if _UKR.search(name) or _LATIN_EXT.search(name):
             return -4
+        # явные метаданные языка/страны считаем ДО проверки названия/группы:
+        # русские каналы могут лежать в группе с немецким топом (group-title="Nachrichten")
+        lang = (attrs.get("tvg-language") or "").lower()
+        has_ru_lang = bool(lang and _RU_LANG.search(lang))
+        tvg_id = (attrs.get("tvg-id") or "").lower().strip()
+        m = _TVGID_CC.search(tvg_id)
+        id_is_ru = bool(m and m.group(1) == "ru")
+        explicit_ru_meta = has_ru_lang or id_is_ru
+        has_cyr_name = bool(_CYR.search(name))
         if _NONRU_NAME.search(name) or (group and _NONRU_NAME.search(group)):
-            return -4
+            # немецкий топик только в группе — слабый признак: не перебивает
+            # кириллическое название или явные русские метаданные
+            if group and not _NONRU_NAME.search(name) and (has_cyr_name or explicit_ru_meta):
+                score -= 1
+            else:
+                return -4
         # точное совпадение с известным немецким каналом (после снятия HD/SD и скобок)
         if _norm(name) in _DE_NAMES:
             return -4
-        has_cyr_name = bool(_CYR.search(name))
         if has_cyr_name:
             score += 2
         if _RU_LATIN.search(name) or _RU_BRANDS.search(name):
             score += 2
-        lang = (attrs.get("tvg-language") or "").lower()
         if lang:
-            score += 3 if _RU_LANG.search(lang) else -3
-        tvg_id = (attrs.get("tvg-id") or "").lower().strip()
-        m = _TVGID_CC.search(tvg_id)
+            score += 3 if has_ru_lang else -3
         if m:
-            score += 2 if m.group(1) == "ru" else -3
+            score += 2 if id_is_ru else -3
         elif _TVGID_UNDER_CC.search(tvg_id):
             score -= 3
         country = (attrs.get("tvg-country") or "").lower().strip()

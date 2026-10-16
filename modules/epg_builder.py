@@ -23,8 +23,11 @@ SUFFIXES = ("fullhd", "fhd", "uhd", "4k", "hd", "sd")
 MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024  # потолок на скачанный ответ, защита от OOM/зловредных серверов
 
 
-def _safe_socket_connect(host, port=None, timeout=None, source_address=None):
-    """socket.create_connection с проверкой: запрещённые адреса (SSRF-guard, в т. ч. DNS-rebinding)."""
+def _safe_socket_connect(address, timeout=None, source_address=None, *, all_errors=False):
+    """socket.create_connection с проверкой: запрещённые адреса (SSRF-guard, в т. ч. DNS-rebinding).
+    Совместим по сигнатуре с socket.create_connection (используется как instance-level
+    _create_connection в HTTPConnection.connect)."""
+    host, port = address
     infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
     if not infos:
         raise OSError(f"Cannot determine address of {host!r}")
@@ -46,24 +49,22 @@ def _safe_socket_connect(host, port=None, timeout=None, source_address=None):
     return sock
 
 
-class _SafeHTTPSConnection(http.client.HTTPSConnection):
-    def connect(self):
-        old = socket.create_connection
-        socket.create_connection = _safe_socket_connect
-        try:
-            super().connect()
-        finally:
-            socket.create_connection = old
-
-
 class _SafeHTTPConnection(http.client.HTTPConnection):
-    def connect(self):
-        old = socket.create_connection
-        socket.create_connection = _safe_socket_connect
-        try:
-            super().connect()
-        finally:
-            socket.create_connection = old
+    """SSRF-guard только для этого экземпляра: HTTPConnection.connect использует
+    self._create_connection (по умолчанию socket.create_connection)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)  # базовый init присваивает self._create_connection
+        self._create_connection = _safe_socket_connect
+
+
+class _SafeHTTPSConnection(http.client.HTTPSConnection):
+    """connect() у HTTPSConnection вызывает super().connect() (HTTPConnection),
+    который берёт self._create_connection — guard наследуется без глобального monkey-patch."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _safe_socket_connect
 
 
 class _SafeHTTPHandler(urllib.request.HTTPHandler):
@@ -76,7 +77,17 @@ class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_SafeHTTPSConnection, req)
 
 
-_opener = urllib.request.build_opener(_SafeHTTPHandler(), _SafeHTTPSHandler())
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Проверяет каждую цель редиректа через validate_epg_url (в т. ч. смену схемы на ftp и т. п.)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        reason = validate_epg_url(newurl)
+        if reason:
+            raise urllib.error.HTTPError(req.full_url, code, f"редирект запрещён: {reason}", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_SafeHTTPHandler(), _SafeHTTPSHandler(), _SafeRedirectHandler())
 
 
 def validate_epg_url(url):
@@ -173,6 +184,22 @@ class _LimitedRead:
         self._left -= len(data)
         return data
 
+    def readline(self, limit=-1):
+        # для совместимости с gzip.GzipFile(fileobj=...), который читает заголовок построчно
+        chunk = self.read(1)
+        line = chunk
+        while chunk and chunk != b"\n":
+            if limit >= 0 and len(line) >= limit:
+                break
+            chunk = self.read(1)
+            line += chunk
+        return line
+
+    def seek(self, *args):
+        raise io.UnsupportedOperation("seek")
+
+    seekable = lambda self: False
+
 
 class _Prepend:
     """File-like: сначала отдаёт prefix (уже прочитанные байты), потом поток."""
@@ -237,7 +264,8 @@ class EpgBuilder:
         stream = _LimitedRead(resp, MAX_DOWNLOAD_BYTES)
         head = stream.read(2)
         if head == b"\x1f\x8b":
-            return gzip.GzipFile(fileobj=_Prepend(head, stream))
+            # лимит применяем и к РАЗЖАТОМУ потоку: gzip-бомбы могут дать ГБ данных из малых файлов
+            return _LimitedRead(gzip.GzipFile(fileobj=_Prepend(head, stream)), MAX_DOWNLOAD_BYTES)
         return _Prepend(head, stream)
 
     # ---------- фильтрация ----------
