@@ -507,7 +507,7 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft()) as app:
                     tester_catchup = gr.Checkbox(label="Добавить catchup (append, ?utc=${start})", value=True)
                     tester_btn = gr.Button("🚀 Запустить тестирование", variant="primary")
                 with gr.Column():
-                    tester_output = gr.File(label="Результат (рабочие + без звука)", file_count="multiple")
+                    tester_output = gr.File(label="Единый плейлист рабочих потоков (включая MP1/MP2)", file_count="multiple")
                     tester_stats = gr.Textbox(label="Статистика", lines=10)
             
             tester_btn.click(
