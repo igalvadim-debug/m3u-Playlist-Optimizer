@@ -10,15 +10,38 @@
 """
 import math
 import re
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from modules.m3u_utils import split_extinf, set_group
+from modules.m3u_utils import split_extinf, set_group, canonical_group
 
 RU_FLAG = "🇷🇺"
 WORLD = "🌍"
 CHUNK_MAX = 50       # максимум каналов в группе
 MIN_GROUP = 12       # тема меньше этого размера сливается в «сборную солянку»
 BATCH = 20           # каналов в одном запросе к модели
+
+# Слова 18+ для ЖЁСТКОГО правила по названию (не зависит от языка канала).
+ADULT_PAT = (r"\bxxx\b|18\+|\+18|эротик|erotic|playboy|\badult\b|brazzers|hustler|penthouse|порн|porn|"
+             r"\banal\b|\bteens?\b|transsexual|transsex|транс|deepthroat|\bmilf\b|\bsex\b|секс|bangbros|"
+             r"realitykings|pornhub|xhamster|redlight|\bdorcel\b|\bvivid\b")
+ADULT_RE = re.compile(ADULT_PAT, re.I)
+
+# Домены провайдеров и зоны, по которым канал считаем русскоязычным.
+RU_DOMAIN_SUBSTR = ("klaipedalt", "akciatv")   # вхождения в хост
+RU_DOMAIN_TLD = (".ru",)                        # зоны-окончания хоста
+
+
+def url_looks_russian(url):
+    """True, если хост URL — русский провайдер/зона (.ru, klaipedalt, akciatv)."""
+    try:
+        host = (urlsplit(url or "").hostname or "").lower()
+    except Exception:
+        host = ""
+    if not host:
+        return False
+    return host.endswith(RU_DOMAIN_TLD) or any(s in host for s in RU_DOMAIN_SUBSTR)
+
 
 # ключ: (эмодзи, название темы, regex по "имя + группа", запасные названия групп)
 CATS = {
@@ -31,7 +54,7 @@ CATS = {
              r"бизнес|business|\bcnn\b|\bbbc\b|al jazeera|аль-джазира|настоящее время|\bдождь\b|царьград",
              ["Главное сейчас", "В курсе событий", "Новостной пульс", "Лента дня", "Горячие новости"]),
     "movies": ("🎬", "Кино",
-               r"кино|фильм|movie|\bfilm\b|cinema|hollywood|боевик|комеди|детектив|ужас|триллер|фантастик|"
+               r"кино|kino|flix|amedia|фильм|movie|\bfilm\b|cinema|hollywood|боевик|комеди|детектив|ужас|триллер|фантастик|"
                r"мосфильм|иллюзион|ностальг",
                ["Кинозал на диване", "Большой экран", "Вечер в кино", "Золотая коллекция", "Киноманам"]),
     "series": ("📺", "Сериалы",
@@ -53,7 +76,7 @@ CATS = {
               r"\bhit\b|караоке|karaoke|\bdance\b|джаз|\bjazz\b|\brock\b|\brap\b",
               ["Музыкальная волна", "Хит-парад", "Заряд музыки", "Звуки и клипы", "Громче!"]),
     "docs": ("🌍", "Познавательные",
-             r"discovery|nat(ional)? ?geo|animal planet|истори|history|наука|science|познават|документал|docu|travel|"
+             r"discovery|national|nat ?geo|investigation|hystory|animal planet|истори|history|наука|science|познават|документал|docu|travel|"
              r"путешеств|техно|моя планета|охота|рыбалк|viasat|nature|планета|здоровье|health|кулинар|\bfood\b|cooking",
              ["Мир вокруг", "Познаём вместе", "Любопытным", "Загадки планеты", "Умный канал"]),
     "religion": ("🕊️", "Религия",
@@ -66,10 +89,10 @@ CATS = {
               r"$^",
               ["Сборная солянка", "Всего понемногу", "Остальное", "Что-нибудь ещё"]),
     "radio": ("📻", "Радио",
-              r"радио|\bradio\b|\bfm\b|радіо",
+              r"радио|\bradio\b|\bfm\b",
               ["В эфире радио", "Радиоволна"]),
     "adult": ("🔞", "Для взрослых",
-              r"\bxxx\b|18\+|\+18|эротик|erotic|playboy|adult|brazzers|hustler|penthouse|порно|porn|секс",
+              ADULT_PAT,
               ["После полуночи", "Только для взрослых"]),
 }
 
@@ -85,6 +108,13 @@ LLM_CATS = ["news", "movies", "series", "sport", "kids", "music", "docs", "enter
 NEVER_POOL = {"adult", "radio"}
 
 _CATS_RE = {k: re.compile(v[2], re.I) for k, v in CATS.items()}
+
+# Группы иностранных каналов по языку, который VL-модель определила по кадру (подсказка).
+LANG_GROUP = {
+    "DE": "🇩🇪 Германия", "EN": "🇬🇧 Английские", "AR": "🌍 Арабские", "TR": "🇹🇷 Турецкие",
+    "FR": "🇫🇷 Французские", "IT": "🇮🇹 Итальянские", "ES": "🇪🇸 Испанские", "PL": "🇵🇱 Польские",
+    "UA": "🇺🇦 Украинские",
+}
 
 SHIFT_REGIONS = {
     -1: "Калининград", 1: "Самара", 2: "Екатеринбург", 3: "Омск", 4: "Красноярск и Новосибирск",
@@ -164,14 +194,64 @@ def _clean_title(text):
     return s[0].upper() + s[1:]
 
 
+class ExceptionList:
+    """
+    Слова из except.md. Канал считается русскоязычным (не удаляется и не уходит в иностранные),
+    если его НАЗВАНИЕ начинается с такого слова ИЛИ слово встречается в названии целиком.
+    Регистр не важен.
+    Короткие слова (до 3 символов: RT, MM, MS, VF, FX) ищутся как начало названия или как
+    отдельное слово — иначе «rt» нашлось бы в Sport, Arte и сотнях других названий.
+    """
+
+    def __init__(self, words):
+        self.words = []
+        self._sub = []     # длинные: ищем где угодно в названии
+        self._short = []   # короткие: начало названия ИЛИ отдельное слово
+        for w in words:
+            w = w.strip()
+            if not w or w in self.words:
+                continue
+            self.words.append(w)
+            if len(w) <= 3:
+                self._short.append((w.casefold(),
+                                    re.compile(r"(?<!\w)" + re.escape(w) + r"(?!\w)", re.I)))
+            else:
+                self._sub.append(w.casefold())
+
+    def __len__(self):
+        return len(self.words)
+
+    def match(self, name):
+        low = (name or "").strip().casefold()
+        if any(w in low for w in self._sub):
+            return True
+        return any(low.startswith(w) or rx.search(name or "") for w, rx in self._short)
+
+
+def load_exceptions(path):
+    """Читает except.md: слова через запятую, кавычки и точка с запятой допускаются в любом виде."""
+    try:
+        text = open(path, "r", encoding="utf-8-sig", errors="ignore").read()
+    except OSError:
+        return ExceptionList([])
+    text = re.sub(r"^\s*except\s*:", "", text, flags=re.I)
+    words = []
+    for part in re.split(r"[,;\n]", text):
+        w = part.strip().strip('"\'“”«»').strip()
+        if w and not w.startswith("#"):
+            words.append(w)
+    return ExceptionList(words)
+
+
 class Organizer:
-    def __init__(self, llm=None, cb=None, stop=None, llm_workers=2):
+    def __init__(self, llm=None, cb=None, stop=None, llm_workers=2, exceptions=None):
+        self.exceptions = exceptions
         self.llm = llm
         self.cb = cb
         self.stop = stop
         self.workers = max(1, int(llm_workers))
         self.llm_ok = llm is not None
-        self.stats = {"ru": 0, "foreign": 0, "shifted": 0, "ru_groups": 0, "foreign_groups": 0,
+        self.stats = {"exceptions": 0, "ru": 0, "foreign": 0, "shifted": 0, "ru_groups": 0, "foreign_groups": 0,
                       "llm_calls": 0, "llm_errors": 0, "llm_lang": 0, "llm_cat": 0}
 
     # ------------------------------------------------------------------
@@ -228,6 +308,9 @@ class Organizer:
         A foreign topic found only in the group is weakened when the name has
         Russian letters or explicit Russian language/ID metadata is present.
         """
+        # URL на домене провайдера (.ru / klaipedalt / akciatv) -> сразу русскоязычный
+        if url_looks_russian(e.get("url")):
+            return 3
         name, group, attrs = e["name"], e["group"], e["attrs"]
         score = 0
         if _UKR.search(name) or _LATIN_EXT.search(name):
@@ -289,6 +372,11 @@ class Organizer:
         undecided = []
         weak = []
         for e in entries:
+            if self.exceptions and self.exceptions.match(e["name"]):
+                e["ru"] = True          # слово из except.md: всегда русскоязычный
+                e["score"] = 9
+                self.stats["exceptions"] += 1
+                continue
             s = self._lang_score(e)
             e["score"] = s
             if s >= 2:
@@ -437,6 +525,35 @@ class Organizer:
         return title
 
     # ------------------------------------------------------------------
+    def _merge_groups_llm(self, names):
+        """Модель сводит синонимичные имена групп -> {старое: новое}.
+        Безопасно: цель обязана быть из этого же списка, иначе группа остаётся как есть —
+        значит ни один канал не теряется (только переименование ключей)."""
+        if not names:
+            return {}
+        numbered = "\n".join(f"{i + 1}. {n}" for i, n in enumerate(names))
+        prompt = (
+            "Ниже список названий групп ТВ-каналов. Сведи синонимичные группы к одному имени "
+            "(например «Музыка»/«Музыкальные»/«Танцевальные»; «Новости»/«Новостные»; "
+            "«Кино»/«Фильмы»/«Кинозал»; «Документальные»/«Познавательные»/«История»). "
+            "Для каждой группы верни итоговое имя — используй имя из ЭТОГО ЖЕ списка "
+            "(выбирай самую общую/крупную группу). Каждую группу укажи ровно один раз, ничего не пропускай. "
+            "Формат: одна строка на группу «N=ИТОГОВОЕ_ИМЯ». Без пояснений.\n\n" + numbered
+        )
+        ans = self._ask(prompt, max_tokens=40 + 10 * len(names))
+        if not ans:
+            return {}
+        valid = set(names)
+        out = {}
+        for m in re.finditer(r"(\d+)\s*[=:]\s*(.+)", ans):
+            i = int(m.group(1))
+            if not (1 <= i <= len(names)):
+                continue
+            new = m.group(2).strip().strip('"\'“”«»').splitlines()[0].strip()[:40]
+            if new in valid:
+                out[names[i - 1]] = new
+        return out
+
     def organize(self, streams):
         """
         streams: список dict с ключами 'info' (строка #EXTINF) и 'url'.
@@ -447,7 +564,8 @@ class Organizer:
         for s in streams:
             _, attrs, name = split_extinf(s["info"])
             entries.append({"stream": s, "name": name or "Без имени",
-                            "group": (attrs.get("group-title") or "").strip(), "attrs": attrs})
+                            "group": (attrs.get("group-title") or "").strip(), "attrs": attrs,
+                            "lang": (s.get("lang") or "").upper(), "url": s.get("url", "")})
         if not entries:
             return {"ru_lines": ["#EXTM3U\n"], "foreign_lines": ["#EXTM3U\n"], "stats": self.stats,
                     "ru_groups": [], "foreign_groups": []}
@@ -512,11 +630,24 @@ class Organizer:
         # ---------- нерусские ----------
         fb = {}
         for e in foreign:
-            g = e["group"] or (e["attrs"].get("tvg-country") or "").strip().upper() or "Прочие"
+            base = canonical_group(e["group"]) or \
+                (e["attrs"].get("tvg-country") or "").strip().upper() or "Прочие"
+            g = LANG_GROUP.get(e.get("lang") or "") or base
             fb.setdefault(g, []).append(e)
+
+        # LLM сводит синонимичные группы (только переименование ключей — каналы не теряются)
+        if self.llm_ok and len(fb) >= 2 and not self._stopped():
+            mapping = self._merge_groups_llm(sorted(fb))
+            if mapping:
+                merged = {}
+                for g, items in fb.items():
+                    merged.setdefault(mapping.get(g, g), []).extend(items)
+                fb = merged
+
         pool = []
+        lang_groups = set(LANG_GROUP.values())
         for g in list(fb):
-            if len(fb[g]) < MIN_GROUP:
+            if len(fb[g]) < MIN_GROUP and g not in lang_groups:
                 pool.extend(fb.pop(g))
         foreign_groups = []
         for g in sorted(fb, key=lambda x: x.lower()):

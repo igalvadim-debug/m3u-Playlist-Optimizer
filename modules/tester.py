@@ -179,74 +179,110 @@ class M3UTester:
                 'tested_at': datetime.now().isoformat()
             }
     
-    def test_playlists(self, m3u_files, progress_callback=None):
+    def test_playlists(self, m3u_files, progress_callback=None, chunk_size=280, save_dir=None):
         """
-        Тестирование списка плейлистов
-        С максимальной стабильностью и поддержкой отмены
+        Тестирование списка плейлистов кусками (по ~chunk_size каналов, всегда < 300).
+
+        Перед фильтрацией создаётся временная папка с проверенными каналами
+        (название: день недели + дата), список нарезается на куски, каждый кусок
+        прогоняется по очереди, результат сохраняется в этой папке, а в конце
+        всё объединяется в один выходной список.
+
+        save_dir — куда складывать файлы кусков (по умолчанию outputs/Проверенные_...).
+        Возвращает (output_lines, stats); self.save_dir — папка проверенных каналов.
         """
         all_streams = []
-        
+
         # Извлекаем потоки из всех файлов
         for m3u_file in m3u_files:
             if progress_callback:
                 progress_callback(f"📂 Обрабатывается: {Path(m3u_file).name}")
-            
+
             streams = self.extract_streams_from_m3u(m3u_file)
             all_streams.extend(streams)
             self.stats['total_streams_found'] += len(streams)
-        
+
         if not all_streams:
             return None, {"error": "Нет потоков для тестирования"}
-        
+
+        # Временная папка с проверенными каналами: название = день, дата, время
+        if save_dir is None:
+            save_dir = Path("outputs") / datetime.now().strftime("Проверенные_%A_%d.%m.%Y_%H-%M-%S")
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        self.save_dir = save_dir
+
+        # Нарезаем список на куски меньше 300 каналов
+        chunk_size = max(1, min(int(chunk_size), 299))
+        chunks = [all_streams[i:i + chunk_size] for i in range(0, len(all_streams), chunk_size)]
+
         if progress_callback:
-            progress_callback(f"🔍 Найдено {len(all_streams)} уникальных потоков. Начинаем тестирование...")
-        
+            progress_callback(
+                f"🔍 Найдено {len(all_streams)} уникальных потоков. "
+                f"Делю на {len(chunks)} кусок(ов) по ≤{chunk_size} и прогоняю по очереди...\n"
+                f"📁 Папка проверенных каналов: {save_dir}")
+
         tested_count = 0
-        
+        total = len(all_streams)
+
         try:
-            # Параллельное тестирование потоков
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                future_to_stream = {
-                    executor.submit(self.test_stream, stream): stream 
-                    for stream in all_streams
-                }
-                
-                for future in as_completed(future_to_stream):
-                    tested_count += 1
-                    result = future.result()
-                    
-                    self.stats['streams_tested'] += 1
-                    
-                    # Обрабатываем результат
-                    if result['status'] == 'working':
-                        self.stats['streams_working'] += 1
-                        self.working_streams.append(result)
-                        status_icon = "✅"
-                    else:
-                        self.stats['streams_failed'] += 1
-                        status_icon = "❌"
-                    
-                    # Прогресс каждые 10 потоков
-                    if progress_callback and (tested_count % 10 == 0 or tested_count == len(all_streams)):
-                        progress = (tested_count / len(all_streams)) * 100
-                        progress_callback(
-                            f"{status_icon} Протестировано: {tested_count}/{len(all_streams)} ({progress:.1f}%) | "
-                            f"Рабочих: {self.stats['streams_working']}"
-                        )
-        
+            for ci, chunk in enumerate(chunks, start=1):
+                if progress_callback:
+                    progress_callback(f"🧩 Кусок {ci}/{len(chunks)}: каналов {len(chunk)}")
+
+                # Прогоняем кусок целиком перед переходом к следующему
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    future_to_stream = {
+                        executor.submit(self.test_stream, stream): stream
+                        for stream in chunk
+                    }
+
+                    for future in as_completed(future_to_stream):
+                        tested_count += 1
+                        result = future.result()
+                        stream = future_to_stream[future]
+                        stream['result'] = result
+
+                        self.stats['streams_tested'] += 1
+
+                        # Обрабатываем результат
+                        if result['status'] == 'working':
+                            self.stats['streams_working'] += 1
+                            self.working_streams.append(result)
+                            status_icon = "✅"
+                        else:
+                            self.stats['streams_failed'] += 1
+                            status_icon = "❌"
+
+                        # Прогресс каждые 10 потоков
+                        if progress_callback and (tested_count % 10 == 0 or tested_count == total):
+                            progress = (tested_count / total) * 100
+                            progress_callback(
+                                f"{status_icon} Протестировано: {tested_count}/{total} ({progress:.1f}%) | "
+                                f"Рабочих: {self.stats['streams_working']}"
+                            )
+
+                # Результат куска — в папку с проверенными каналами
+                chunk_file = save_dir / f"chunk_{ci:03d}.m3u"
+                self._write_chunk(chunk_file, chunk)
+
+                if progress_callback:
+                    progress_callback(f"💾 Кусок {ci}/{len(chunks)} сохранён: {chunk_file.name}")
+
         except KeyboardInterrupt:
             if progress_callback:
                 progress_callback("⚠️ Прервано пользователем!")
             raise
-        
-        # Формируем выходной M3U файл
+
+        # В конце объединяем результаты всех кусков в один файл
         output_lines = ["#EXTM3U\n"]
         output_lines.append(f"# Сгенерировано: {datetime.now().isoformat()}\n")
         output_lines.append(f"# Всего протестировано: {self.stats['streams_tested']}\n")
         output_lines.append(f"# Рабочих потоков: {len(self.working_streams)}\n")
         output_lines.append(f"# Дубликатов удалено: {self.stats['streams_duplicate']}\n")
+        output_lines.append(f"# Кусков прогнано: {len(chunks)}, папка проверенных: {save_dir}\n")
         output_lines.append("#" + "="*60 + "\n\n")
-        
+
         # Сортируем по исходному файлу
         current_source = None
         for stream in sorted(self.working_streams, key=lambda x: x.get('source_file', '')):
@@ -256,8 +292,21 @@ class M3UTester:
                 if current_source:
                     output_lines.append(f"\n# ИСТОЧНИК: {current_source}\n")
                     output_lines.append("#" + "-"*50 + "\n")
-            
+
             output_lines.append(f"{stream['info']}\n")
             output_lines.append(f"{stream['url']}\n")
-        
+
         return output_lines, self.stats
+
+    @staticmethod
+    def _write_chunk(path, chunk):
+        """Сохраняет проверенный кусок: все каналы с пометкой OK/FAIL."""
+        lines = ["#EXTM3U\n", "# Проверенный кусок (папка с проверенными каналами)\n"]
+        for s in chunk:
+            res = s.get('result') or {}
+            status = res.get('status', 'unknown')
+            mark = "OK" if status == 'working' else "FAIL"
+            lines.append(f"# [{mark}] {s.get('source_file', '')}\n")
+            lines.append(f"{s['info']}\n")
+            lines.append(f"{s['url']}\n")
+        Path(path).write_text("".join(lines), encoding="utf-8")

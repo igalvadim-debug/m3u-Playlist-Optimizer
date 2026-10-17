@@ -60,11 +60,12 @@ assert len(urls) == len(set(urls)), "при merge появились дубли�
 # --- EPG: из поля если заполнено, иначе первая из первого плейлиста; в шапке одна ссылка
 lines = m.write_lines(state)
 epg_field = "https://my.epg/x.xml.gz, https://my.epg/y.xml.gz"
-out = apply_header(lines, m.pick_epg(state, epg_field), True, single=True)
+out = apply_header(lines, m.pick_epg(state, epg_field), "append", single=True, catchup_source="?utc=${start}")
 assert out[0].startswith("#EXTM3U"), out[0]
+assert 'catchup="append"' in out[0] and 'catchup-source="?utc=${start}"' in out[0], out[0]
 assert 'url-tvg="https://my.epg/x.xml.gz"' in out[0] and "y.xml.gz" not in out[0], out[0]
 assert sum(1 for ln in out if ln.upper().startswith("#EXTM3U")) == 1
-out2 = apply_header(lines, m.pick_epg(state, ""), True, single=True)
+out2 = apply_header(lines, m.pick_epg(state, ""), "append", single=True, catchup_source="?utc=${start}")
 assert 'url-tvg="https://epg.one/a.xml.gz"' in out2[0], out2[0]
 
 # --- группы читаются из файлов, EXTGRP тоже

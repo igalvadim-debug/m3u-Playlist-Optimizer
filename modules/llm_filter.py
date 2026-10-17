@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 from modules.tester import M3UTester
+from modules.organizer import ADULT_RE
 
 logger = logging.getLogger("m3ugenius.llm_filter")
 
@@ -42,28 +43,40 @@ MMPROJ_PATH = Path(os.environ.get(
 
 SERVER_LOG = Path(os.environ.get("M3UGENIUS_OUTPUT_DIR", "outputs")) / "llama_server_7845.log"
 SERVER_START_TIMEOUT = 240  # секунд на загрузку модели
-FRAME_STEP = 1.5  # интервал между кадрами одного канала, секунды (заглушки-анимации меняются во времени)
+FRAME_STEP = 2.0  # интервал между кадрами одного канала, секунды (два кадра ≈ 4 сек)
 
 PROMPT = (
     "You are checking a single frame taken from a live TV stream. "
-    "Decide whether the frame is a placeholder/stub screen instead of real TV content: "
-    "a screen whose main content is a TEXT message saying that the channel or service cannot be watched. "
-    "Examples of such stubs: "
-    "(1) payment or subscription required: 'pay for the subscription', 'subscription expired', "
-    "'top up your balance', 'access is closed until payment', 'buy a package', prices, bank cards, "
-    "activation or renewal instructions; "
-    "(2) the service or app is no longer available, was discontinued or shut down, 'no longer available "
-    "on this device', 'the end', \"C'est fini\", please use another app or update the app; "
-    "(3) the channel is not available in your country or region, geo-blocked; "
-    "(4) the channel is offline, temporarily unavailable, off air, 'no signal', transmission ended; "
-    "(5) error or access-denied messages, device not supported; "
-    "(6) a farewell or closing screen: 'that's all', 'that's a wrap', 'it's over', 'we are leaving', "
-    "or an instruction to go to a website or app to find where to watch the channels now or next. "
-    "The text can be in any language (Russian, English, German, French, etc.). "
-    "A normal TV picture (movie, show, news, sport, cartoon, music clip), a channel logo, a test card, "
-    "a plain black screen, or a small watermark/ticker is NOT such a stub. "
-    "Answer with exactly one word: STUB if it is such a stub screen, otherwise OK."
+    "Answer with EXACTLY one line, format TAG or TAG:LANG.\n"
+    "TAG is one of:\n"
+    "- STUB: the frame is a placeholder/stub screen instead of real TV content — its main content is a "
+    "TEXT message that the channel/service cannot be watched. Examples: payment or subscription required "
+    "(pay, top up balance, subscription expired, buy a package, prices, bank cards); the service/app is no "
+    "longer available or shut down or you should use another app; not available in your country / geo-blocked; "
+    "channel offline, no signal, transmission ended; error or access denied; a farewell/closing screen telling "
+    "where to watch now. The stub text can be in any language.\n"
+    "- ADULT: the frame shows explicit pornographic / 18+ content (visible nudity or a sex act).\n"
+    "- OK: anything else — a normal TV picture (movie, show, news, sport, cartoon, music clip), a channel "
+    "logo, a test card, a plain black screen, or a small watermark/ticker.\n"
+    "LANG (optional, only when TAG is OK): the main on-screen language/country of the visible text or "
+    "content, one of RU, DE, EN, AR, TR, FR, IT, ES, UA, PL, OTHER. If unsure, omit LANG.\n"
+    "Examples: STUB | ADULT | OK | OK:RU | OK:DE | OK:EN | OK:AR | OK:TR.\n"
+    "Answer with that single line only, no other words."
 )
+
+# Языки, которые распознаёт VL-модель (подсказка для групп иностранных каналов)
+_LANG_OK = {"RU", "DE", "EN", "AR", "TR", "FR", "IT", "ES", "UA", "PL", "OTHER"}
+_VERDICT_RE = re.compile(r"\b(STUB|ADULT|OK)\b\s*(?:[:;(\-]\s*([A-Za-z]{2}))?", re.I)
+
+
+def parse_verdict(answer):
+    """Ответ модели -> (тег, язык). Тег: STUB / ADULT / OK. Не распознали -> ('OK', '')."""
+    m = _VERDICT_RE.search(answer or "")
+    if not m:
+        return "OK", ""
+    tag = m.group(1).upper()
+    lang = (m.group(2) or "").upper()
+    return tag, (lang if lang in _LANG_OK else "")
 
 
 def _top_reasons(dead, top=3):
@@ -127,8 +140,10 @@ def _probe_audio(url, timeout=8):
 
 class LLMFilter:
     def __init__(self, ffmpeg_timeout=8, ffmpeg_workers=15, llm_workers=2,
-                 remove_no_frame=False, frames_per_channel=3, keep_server=False,
-                 check_bad_audio=True):
+                 remove_no_frame=False, frames_per_channel=2, keep_server=False,
+                 check_bad_audio=True, separate_adult=True, adult_by_frame=True):
+        self.separate_adult = bool(separate_adult)
+        self.adult_by_frame = bool(adult_by_frame)
         self.keep_server = bool(keep_server)
         self.ffmpeg_timeout = int(ffmpeg_timeout)
         self.ffmpeg_workers = int(ffmpeg_workers)
@@ -368,7 +383,7 @@ class LLMFilter:
             "found": 0, "duplicates": 0,
             "ffmpeg_working": 0, "ffmpeg_dead": 0,
             "checked": 0, "payment": 0, "ok": 0,
-            "no_frame": 0, "no_frame_removed": 0, "llm_errors": 0,
+            "no_frame": 0, "no_frame_removed": 0, "llm_errors": 0, "adult": 0,
             "bad_audio": 0, "bad_audio_removed": 0,
             "kept": 0, "interrupted": False,
         }
@@ -388,6 +403,20 @@ class LLMFilter:
 
         if not streams:
             raise RuntimeError("В файлах нет потоков для проверки")
+
+        kept, removed, bad_audio, adult = [], [], [], []
+
+        # ---- Жёсткое правило 18+ по названию (если включено; язык не важен) ----
+        if self.separate_adult:
+            adult = [(s, "18+ (имя)") for s in streams if ADULT_RE.search(self.channel_name(s["info"]))]
+            if adult:
+                stats["adult"] += len(adult)
+                streams = [s for s in streams if not ADULT_RE.search(self.channel_name(s["info"]))]
+                self._emit(0.0, "18+ по названию",
+                           f"🔞 Вынесено 18+ по названию: {len(adult)}")
+        if not streams:
+            self._emit(1.0, "Готово", "🔞 Все каналы вынесены как 18+")
+            return self._build(kept, removed, stats, adult)
 
         self._emit(0.0, "FFmpeg: проверка потоков", f"🔍 Уникальных потоков: {len(streams)} (дубликатов пропущено: {stats['duplicates']}). Шаг 1: FFmpeg-проверка")
 
@@ -465,15 +494,12 @@ class LLMFilter:
 
         working.sort(key=lambda s: s["idx"])
 
-        kept, removed = [], []
-        bad_audio = []
-
         if stats["interrupted"]:
-            return self._build(kept, removed, stats, bad_audio)
+            return self._build(kept, removed, stats, adult)
 
         if not working:
             self._emit(1.0, "Готово", "⚠️ Рабочих потоков не найдено")
-            return self._build(kept, removed, stats, bad_audio)
+            return self._build(kept, removed, stats, adult)
 
         # ---------------- Шаг 2: плохое аудио (ffprobe) ----------------
         # Каналы без звуковой дорожки откладываются в отдельный список:
@@ -490,7 +516,7 @@ class LLMFilter:
                         for f2 in futures:
                             f2.cancel()
                         stats["interrupted"] = True
-                        return self._build(kept, removed, stats, bad_audio)
+                        return self._build(kept, removed, stats, adult)
                     s = futures[fut]
                     try:
                         verdict = fut.result()
@@ -527,28 +553,33 @@ class LLMFilter:
 
             def process(stream):
                 if self._stopped():
-                    return stream, "stopped", ""
+                    return stream, "stopped", "", ""
                 frames = self.grab_frames(stream["url"])
                 if not frames:
                     single = self.grab_frame(stream["url"])
                     frames = [single] if single else []
                 if not frames:
-                    return stream, "noframe", ""
-                last_answer, error = "", ""
+                    return stream, "noframe", "", ""
+                last_answer, last_lang, error = "", "", ""
                 with sem:
                     for jpeg in frames:
                         if self._stopped():
-                            return stream, "stopped", ""
+                            return stream, "stopped", "", ""
                         try:
                             last_answer = self.ask_model(jpeg)
                         except Exception as e:
                             error = str(e)[:120]
                             continue
-                        if self.is_payment(last_answer):
-                            return stream, "payment", last_answer
+                        tag, lang = parse_verdict(last_answer)
+                        if lang:
+                            last_lang = lang
+                        if tag == "STUB":
+                            return stream, "stub", last_lang, last_answer
+                        if tag == "ADULT" and self.separate_adult and self.adult_by_frame:
+                            return stream, "adult", last_lang, last_answer
                 if error and not last_answer:
-                    return stream, "llmerror", error
-                return stream, "ok", last_answer
+                    return stream, "llmerror", "", error
+                return stream, "ok", last_lang, last_answer
 
             results = {}
             done = 0
@@ -560,15 +591,18 @@ class LLMFilter:
                             f2.cancel()
                         stats["interrupted"] = True
                         break
-                    stream, verdict, answer = fut.result()
+                    stream, verdict, lang, answer = fut.result()
                     done += 1
-                    results[stream["idx"]] = (stream, verdict, answer)
+                    results[stream["idx"]] = (stream, verdict, lang, answer)
                     name = self.channel_name(stream["info"])
 
                     line = None
-                    if verdict == "payment":
+                    if verdict == "stub":
                         stats["payment"] += 1
                         line = f"🗑️ Удалён (заглушка): {name}"
+                    elif verdict == "adult":
+                        stats["adult"] += 1
+                        line = f"🔞 18+ по кадру: {name}"
                     elif verdict == "ok":
                         stats["ok"] += 1
                     elif verdict == "noframe":
@@ -583,16 +617,20 @@ class LLMFilter:
                                f"Модель: {done}/{n} · удалено заглушек {stats['payment']}", line)
 
             if stats["interrupted"]:
-                return self._build(kept, removed, stats)
+                return self._build(kept, removed, stats, adult)
 
             for idx in sorted(results):
-                stream, verdict, answer = results[idx]
-                if verdict == "payment":
-                    removed.append((stream, "заглушка: " + answer))
+                stream, verdict, lang, answer = results[idx]
+                if verdict == "stub":
+                    removed.append((stream, "заглушка — " + (answer or "?")))
+                elif verdict == "adult":
+                    adult.append((stream, "18+ (кадр)"))
                 elif verdict == "noframe" and self.remove_no_frame:
                     stats["no_frame_removed"] += 1
                     removed.append((stream, "кадр не получен"))
                 else:
+                    if lang:
+                        stream["lang"] = lang
                     kept.append(stream)
 
         finally:
@@ -600,20 +638,29 @@ class LLMFilter:
                 self.stop_server()
 
         self._emit(1.0, "Готово", "✅ Готово")
-        return self._build(kept, removed, stats)
+        return self._build(kept, removed, stats, adult)
 
     # ------------------------------------------------------------------
-    def _build(self, kept, removed, stats):
+    def _build(self, kept, removed, stats, adult=None):
+        adult = adult or []
         stats["kept"] = len(kept)
         now = datetime.now().isoformat()
 
         kept_lines = ["#EXTM3U\n",
                       f"# Сгенерировано: {now}\n",
                       f"# Каналов оставлено: {len(kept)}\n",
-                      f"# Удалено заглушек: {stats['payment']}\n\n"]
+                      f"# Удалено заглушек: {stats['payment']}\n",
+                      f"# Вынесено 18+: {len(adult)}\n\n"]
         for s in kept:
             kept_lines.append(f"{s['info']}\n")
             kept_lines.append(f"{s['url']}\n")
+
+        adult_lines = ["#EXTM3U\n",
+                       f"# Каналы 18+ — {now}\n\n"]
+        for s, reason in adult:
+            adult_lines.append(f"# Причина: {reason}\n")
+            adult_lines.append(f"{s['info']}\n")
+            adult_lines.append(f"{s['url']}\n")
 
         removed_lines = ["#EXTM3U\n",
                          f"# Удалённые каналы (отчёт) — {now}\n\n"]
@@ -622,5 +669,15 @@ class LLMFilter:
             removed_lines.append(f"{s['info']}\n")
             removed_lines.append(f"{s['url']}\n")
 
-        return {"kept_lines": kept_lines, "removed_lines": removed_lines, "kept_streams": kept,
-                "stats": stats}
+        report_lines = [f"# Отчёт LLM-фильтра — {now}\n",
+                        f"# Оставлено: {len(kept)} | Удалено (заглушки): {len(removed)} | 18+: {len(adult)}\n\n"]
+        for s in kept:
+            report_lines.append(f"OK     | {self.channel_name(s['info'])}\n")
+        for s, reason in removed:
+            report_lines.append(f"УДАЛЕНО | {reason} | {self.channel_name(s['info'])}\n")
+        for s, reason in adult:
+            report_lines.append(f"18+    | {reason} | {self.channel_name(s['info'])}\n")
+
+        return {"kept_lines": kept_lines, "removed_lines": removed_lines,
+                "adult_lines": adult_lines, "report_lines": report_lines,
+                "kept_streams": kept, "stats": stats}

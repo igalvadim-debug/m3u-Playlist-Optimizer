@@ -8,7 +8,7 @@ M3U Merger Module
 from pathlib import Path
 
 from modules.header import split_epg
-from modules.m3u_utils import parse_m3u, url_key, entry_to_lines
+from modules.m3u_utils import parse_m3u, url_key, entry_to_lines, canonical_group
 
 NO_GROUP = "Без группы"
 HISTORY_LIMIT = 20
@@ -53,7 +53,7 @@ class M3UMerger:
                     stats["duplicates"] += 1
                     continue
                 seen.add(key)
-                group = e["group"] or NO_GROUP
+                group = canonical_group(e["group"]) or NO_GROUP
                 state["groups"].setdefault(group, []).append(e)
                 stats["kept"] += 1
         return state, stats
