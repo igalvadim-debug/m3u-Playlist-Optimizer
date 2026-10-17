@@ -8,6 +8,7 @@ import gradio as gr
 import json
 import os
 import queue
+import re
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -20,8 +21,9 @@ from modules.llm_filter import LLMFilter, LLM_PORT
 from modules.header import (DEFAULT_EPG, apply_header, EPG_CHOICES, EPG_SOURCES,
                            EPG_TITLES, epg_from_choice,
                            CATCHUP_LABELS, CATCHUP_DEFAULT, archive_params, catchup_mode_of)
-from modules.m3u_utils import parse_m3u, url_key, set_group, split_extinf, canonical_group
-from modules.organizer import Organizer, load_exceptions
+from modules.m3u_utils import (parse_m3u, url_key, set_group, split_extinf, canonical_group,
+                               merge_group_synonyms)
+from modules.organizer import Organizer, load_exceptions, load_priority
 from modules import logos
 
 
@@ -31,6 +33,14 @@ EXCEPT_FILE = (OUTPUT_DIR if OUTPUT_DIR.is_absolute() else Path(__file__).resolv
 # Метод отделения 18+: подпись radio -> значение
 PORN_METHODS = {"Только по названию": "name", "По названию и по кадру (VL)": "frame"}
 FONT_PATH = Path("ttf/DejaVuSans.ttf")
+# priority.md — порядок каналов внутри группы; sort_cache.json — кэш решений сортировки (удалите файл, чтобы сбросить)
+_OUT_ABS = OUTPUT_DIR if OUTPUT_DIR.is_absolute() else Path(__file__).resolve().parent / OUTPUT_DIR
+PRIORITY_FILE = _OUT_ABS / "priority.md"
+SORT_CACHE_FILE = _OUT_ABS / "sort_cache.json"
+DEFAULT_PRIORITY = ("# Порядок каналов внутри группы: эти каналы стоят первыми, в заданном порядке.\n"
+                    "# Названия через запятую или по одному на строку. Строки с # — комментарии. HD/SD в названии не важны.\n"
+                    "Первый канал, Россия 1, Матч ТВ, НТВ, Пятница, Звезда, ТВ Центр, РЕН ТВ, СТС, Домашний, "
+                    "ТВ-3, ТНТ, Мир, Россия К, Россия 24, Карусель, ОТР, Спас, Че, Ю, Суббота, Перец\n")
 SERVER_PORT = int(os.environ.get("M3UGENIUS_PORT", "7860"))
 
 # Подсказки при наведении мыши (title-атрибут) для выпадающих списков EPG.
@@ -75,6 +85,25 @@ def _load_exceptions():
         _exceptions_cache["obj"] = load_exceptions(EXCEPT_FILE)
         _exceptions_cache["mtime"] = mtime
     return _exceptions_cache["obj"]
+
+
+_priority_cache = {"mtime": None, "obj": None}
+
+
+def _load_priority():
+    """Приоритет каналов из outputs/priority.md (создаётся с примером при первом запуске).
+    Файл перечитывается только при изменении."""
+    try:
+        if not PRIORITY_FILE.exists():
+            PRIORITY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            PRIORITY_FILE.write_text(DEFAULT_PRIORITY, encoding="utf-8")
+        mtime = PRIORITY_FILE.stat().st_mtime
+    except OSError:
+        return load_priority(PRIORITY_FILE)
+    if _priority_cache["mtime"] != mtime:
+        _priority_cache["obj"] = load_priority(PRIORITY_FILE)
+        _priority_cache["mtime"] = mtime
+    return _priority_cache["obj"]
 
 
 _logo_cache = {"obj": None}
@@ -248,6 +277,7 @@ def cleaner_function(files, blocklist_text, epg_choice=None, epg_custom="", catc
     
     _mode, _src = archive_params(catchup_choice, catchup_source)
     result = apply_header(result, epg_url, _mode, catchup_source=_src)
+    result = merge_group_synonyms(result)
     output_file = output_folder / "cleaned.m3u"
     with open(output_file, 'w', encoding='utf-8') as f:
         f.writelines(result)
@@ -289,6 +319,7 @@ def tester_function(files, timeout, workers, epg_choice=None, epg_custom="", cat
 
     _mode, _src = archive_params(catchup_choice, catchup_source)
     result = apply_header(result, epg_url, _mode, catchup_source=_src)
+    result = merge_group_synonyms(result)
     output_file = output_folder / "tested_working.m3u"
     with open(output_file, 'w', encoding='utf-8') as f:
         f.writelines(result)
@@ -406,12 +437,17 @@ def _split_foreign_keep(streams, exceptions=None):
             e["group"] = (attrs.get("group-title") or "").strip()
         except Exception:
             pass
-        if exceptions and exceptions.match(e["name"]):
+        if exceptions and exceptions.match(e["name"]) and not Organizer._foreign_evidence(e):
             ru.append(s)
             kept_by_exc += 1
             continue
+        if Organizer._is_cis(e):
+            ru.append(s)   # Украина/Беларусь остаются: Organizer соберёт их в группу «СНГ»
+            continue
         score = Organizer._lang_score(e)
-        (ru if score >= 2 else foreign).append(s)
+        # спорные (0…1) с кириллицей в названии считаем русскими, остальные — иностранными
+        is_ru = score >= 2 or (score >= 0 and bool(re.search(r"[А-Яа-яЁё]", e["name"])))
+        (ru if is_ru else foreign).append(s)
     return ru, foreign, kept_by_exc
 
 
@@ -460,6 +496,15 @@ def _vl_adult_split(streams, cb):
 
 
 def _group_by_topics(streams):
+    """Группировка по темам — та же логика, что и в вкладке LLM-Filter (Organizer без модели, язык не перепроверяется):
+    сдвиги времени, группы по ≤ 50, приоритеты, качество, кэш названий. Возвращает (строки, сводка)."""
+    org = Organizer(llm=None, exceptions=_load_exceptions(), priority=_load_priority(),
+                    cache_path=SORT_CACHE_FILE, skip_language=True)
+    res = org.organize(streams)
+    return res["ru_lines"], res["ru_groups"]
+
+
+def _group_by_topics_old(streams):
     """Разбивает каналы на группы по темам (правила Organizer'а, без модели)."""
     from modules.organizer import Organizer, CATS
     groups_map = {}
@@ -701,6 +746,7 @@ def epg_function(files, sources_choice=None, sources_custom="", epg_choice=None,
 
     lines, added = EpgBuilder.annotate_playlist([f.name for f in files], name2id)
     # Ссылка в шапку плейлиста: своё значение, а если пусто — берём те же ссылки EPG
+    lines = merge_group_synonyms(lines)
     header_url = (epg_url or "").strip() or sources
     _mode, _src = archive_params(catchup_choice, catchup_source)
     lines = apply_header(lines, header_url, _mode, catchup_source=_src)
@@ -875,7 +921,7 @@ def _read_streams_for_sort(file_paths, cb):
     return streams
 
 
-def _run_sort(filt, streams, cb, stop_event, llm_workers):
+def _run_sort(filt, streams, cb, stop_event, llm_workers, best_quality=False):
     """Запускает умную сортировку. Если модель недоступна, работает по правилам"""
     llm = None
     try:
@@ -883,7 +929,8 @@ def _run_sort(filt, streams, cb, stop_event, llm_workers):
         llm = filt
     except Exception as e:
         cb(0.0, "Сортировка без модели", f"⚠️ Модель недоступна ({e}). Сортирую только по правилам")
-    org = Organizer(llm=llm, cb=cb, stop=stop_event, llm_workers=llm_workers, exceptions=_load_exceptions())
+    org = Organizer(llm=llm, cb=cb, stop=stop_event, llm_workers=llm_workers, exceptions=_load_exceptions(),
+                    priority=_load_priority(), cache_path=SORT_CACHE_FILE, best_quality=best_quality)
     return org.organize(streams)
 
 
@@ -897,7 +944,7 @@ def _groups_text(groups, limit=60):
 def llm_filter_function(files, timeout, ffmpeg_workers, llm_workers, frames, remove_no_frame,
                         sort_enabled, sort_only, epg_choice=None, epg_custom="",
                         catchup_choice="", catchup_source="",
-                        add_logos=True, separate_porn=True, porn_method="По названию и по кадру (VL)",
+                        add_logos=True, separate_porn=True, best_quality=False, porn_method="По названию и по кадру (VL)",
                         progress=gr.Progress()):
     """FFmpeg-отсев + проверка кадров моделью (удаление заглушек) + умная сортировка по группам"""
     if not files:
@@ -939,7 +986,7 @@ def llm_filter_function(files, timeout, ffmpeg_workers, llm_workers, frames, rem
                 if sort_enabled and not st["interrupted"] and st["ffmpeg_working"] > 0:
                     streams = res["kept_streams"]
             if sort_enabled and streams:
-                holder["sorted"] = _run_sort(filt, streams, cb, stop_event, llm_workers)
+                holder["sorted"] = _run_sort(filt, streams, cb, stop_event, llm_workers, best_quality)
         except Exception as e:
             holder["error"] = str(e)
         finally:
@@ -1007,12 +1054,18 @@ def llm_filter_function(files, timeout, ffmpeg_workers, llm_workers, frames, rem
         with open(foreign_file, 'w', encoding='utf-8') as f:
             f.writelines(apply_header(foreign_lines, epg_url, _mode, catchup_source=_src))
         out_files += [str(ru_file), str(foreign_file)]
+        if sorted_res.get("report_lines"):
+            sort_report = output_folder / "sort_report.txt"
+            with open(sort_report, 'w', encoding='utf-8') as f:
+                f.writelines(sorted_res["report_lines"])
+            out_files.append(str(sort_report))
+            saved.append(f"- 📋 Отчёт сортировки (почему канал в группе): {sort_report}")
         saved.append(f"- Русскоязычные по темам: {ru_file}")
         saved.append(f"- Нерусскоязычные (отдельно): {foreign_file}")
 
     if result is not None:
         if sorted_res is None:
-            kept_lines = result["kept_lines"]
+            kept_lines = merge_group_synonyms(result["kept_lines"])
             if add_logos:
                 kept_lines, n1, _ = logos.apply_logos_to_lines(kept_lines, _logo_matcher())
                 icons_n += n1
@@ -1267,6 +1320,7 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft(), head=EPG_HEAD_HTML) as
                     llm_remove_noframe = gr.Checkbox(label="Удалять каналы, у которых не удалось получить кадр", value=False)
                     llm_sort = gr.Checkbox(label="🗂 Отсортировать: русскоязычные по темам (группы по 40–50 каналов), нерусскоязычные в отдельный файл", value=False)
                     llm_sort_only = gr.Checkbox(label="Только сортировка, без проверки потоков (быстро, для уже очищенного плейлиста)", value=False)
+                    llm_best = gr.Checkbox(label="Оставлять только лучшее качество, если канал в списке повторяется (HD / FHD / SD одного и того же; только с сортировкой)", value=False)
                     llm_logos = gr.Checkbox(label="Пришить иконки каналов (tvg-logo)", value=True)
                     llm_porn = gr.Checkbox(label="Отделять 18+/порно в отдельный список (adult_18plus.m3u)", value=True)
                     llm_porn_method = gr.Radio(choices=list(PORN_METHODS),
@@ -1286,7 +1340,7 @@ with gr.Blocks(title="m3uGenius", theme=gr.themes.Soft(), head=EPG_HEAD_HTML) as
                 llm_filter_function,
                 inputs=[llm_files, llm_timeout, llm_ffmpeg_workers, llm_workers, llm_frames, llm_remove_noframe,
                         llm_sort, llm_sort_only, llm_epg, llm_epg_custom, llm_catchup, llm_catchup_src, llm_logos,
-                        llm_porn, llm_porn_method],
+                        llm_porn, llm_best, llm_porn_method],
                 outputs=[llm_output, llm_stats]
             )
             llm_catchup.change(_toggle_catchup_src, inputs=llm_catchup, outputs=llm_catchup_src)

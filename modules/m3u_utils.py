@@ -10,7 +10,7 @@ GROUP_SYNONYMS = [
     ["Музыка", "Музыкальные", "Танцевальные", "Музыкальный", "Музыкальное"],
     ["Новости", "Новостные", "Информационные", "Информация"],
     ["Кино", "Фильмы", "Кинозал", "Кинотеатр", "Фильмовые"],
-    ["Дети", "Детские", "Детям", "Детский", "Мультфильмы", "Мультики", "Мульт"],
+    ["Дети", "Детские", "Детское", "Детская", "Детям", "Детский", "Мультфильмы", "Мультики", "Мульт"],
     ["Спорт", "Спортивные", "Спортивный"],
     ["Документальные", "Познавательные", "Познавательное", "Исторические", "История"],
     ["Путешествия", "Поездки", "Мир вокруг", "Кругосветка"],
@@ -22,16 +22,46 @@ GROUP_SYNONYMS = [
 _GROUP_ALIASES = [(g[0], [a.lower() for a in g]) for g in GROUP_SYNONYMS]
 
 
+_ADULT_CANON = "Для взрослых"
+
+
 def canonical_group(name):
-    """Синонимичные группы -> канон (первый в списке GROUP_SYNONYMS). Иначе имя как есть."""
+    """Синонимичные группы -> канон (первый в списке GROUP_SYNONYMS). Иначе имя как есть.
+    Из нескольких совпавших синонимов берётся тот, что стоит в названии раньше всех
+    («Детские фильмы» -> «Дети»); «18+» / «Для взрослых» перебивает всё («Фильмы 18+»)."""
     if not name:
         return name
     low = name.strip().lower()
+    best = None   # (позиция, -длина, канон)
     for canon, aliases in _GROUP_ALIASES:
         for a in aliases:
-            if re.search(r"(?<!\w)" + re.escape(a) + r"(?!\w)", low):
+            m = re.search(r"(?<!\w)" + re.escape(a) + r"(?!\w)", low)
+            if not m:
+                continue
+            if canon == _ADULT_CANON:
                 return canon
-    return name
+            cand = (m.start(), -len(a), canon)
+            if best is None or cand < best:
+                best = cand
+    return best[2] if best else name
+
+
+_GROUP_TITLE_RE = re.compile(r'(group-title=")([^"]*)(")')
+
+
+def merge_group_synonyms(lines):
+    """Склеивает очевидные синонимы групп в строках #EXTINF на лету (для любого этапа).
+    Не трогает пустые группы и группы без синонимов. Возвращает новый список строк."""
+    out = []
+    for ln in lines:
+        if ln.startswith("#EXTINF") and "group-title=" in ln:
+            def _sub(m):
+                g = m.group(2)
+                c = canonical_group(g) if g.strip() else g
+                return m.group(1) + (c or g) + m.group(3)
+            ln = _GROUP_TITLE_RE.sub(_sub, ln, count=1)
+        out.append(ln)
+    return out
 
 
 _ATTR_RE = re.compile(r'([\w\-.]+)\s*=\s*(?:"([^"]*)"|([^\s"]+))')
@@ -133,6 +163,13 @@ def parse_m3u(path):
             info = pending or "#EXTINF:-1,Без имени"
             dur, attrs, name = split_extinf(info)
             group = (attrs.get("group-title") or ext_group or "").strip()
+            canon = canonical_group(group) if group else group
+            if canon and canon != group:
+                # очевидные синонимы групп склеиваются сразу при чтении
+                group = canon
+                attrs = dict(attrs)
+                attrs["group-title"] = group
+                info = build_extinf(dur, attrs, name)
             entries.append({
                 "name": name or "Без имени",
                 "group": group,

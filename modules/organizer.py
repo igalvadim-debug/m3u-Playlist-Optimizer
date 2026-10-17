@@ -8,7 +8,9 @@
    с творческими названиями (Qwen, запасной вариант — готовые названия).
 3. Нерусскоязычные уходят в отдельный список (группы по исходному group-title, тоже не больше 50 каналов).
 """
+import json
 import math
+import os
 import re
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,18 +20,20 @@ from modules.m3u_utils import split_extinf, set_group, canonical_group
 RU_FLAG = "🇷🇺"
 WORLD = "🌍"
 CHUNK_MAX = 50       # максимум каналов в группе
-MIN_GROUP = 12       # тема меньше этого размера сливается в «сборную солянку»
+MIN_GROUP = 6       # тема меньше этого размера сливается в «сборную солянку»
+# Куда сливается слишком маленькая тема (иначе — в «Разное»)
+MERGE_TO = {"religion": "docs", "series": "movies", "entertain": "movies", "regional": "other"}
 BATCH = 20           # каналов в одном запросе к модели
 
 # Слова 18+ для ЖЁСТКОГО правила по названию (не зависит от языка канала).
 ADULT_PAT = (r"\bxxx\b|18\+|\+18|эротик|erotic|playboy|\badult\b|brazzers|hustler|penthouse|порн|porn|"
-             r"\banal\b|\bteens?\b|transsexual|transsex|транс|deepthroat|\bmilf\b|\bsex\b|секс|bangbros|"
+             r"\banal\b|\bteens?\b|transsexual|transsex|транссексуал|\bтранс\b|deepthroat|\bmilf\b|\bsex\b|\bсекс|bangbros|"
              r"realitykings|pornhub|xhamster|redlight|\bdorcel\b|\bvivid\b")
 ADULT_RE = re.compile(ADULT_PAT, re.I)
 
 # Домены провайдеров и зоны, по которым канал считаем русскоязычным.
 RU_DOMAIN_SUBSTR = ("klaipedalt", "akciatv")   # вхождения в хост
-RU_DOMAIN_TLD = (".ru",)                        # зоны-окончания хоста
+RU_DOMAIN_TLD = (".ru", ".su", ".xn--p1ai", ".black", ".red")                        # зоны-окончания хоста
 
 
 def url_looks_russian(url):
@@ -38,6 +42,10 @@ def url_looks_russian(url):
         host = (urlsplit(url or "").hostname or "").lower()
     except Exception:
         host = ""
+    if not host:
+        # адрес без схемы (klaipedalt.ru/path) или нестандартная запись
+        m = re.match(r"\s*(?:[a-z][a-z0-9+.\-]*://)?(?:[^/@]*@)?([^/:?#\s]+)", url or "", re.I)
+        host = (m.group(1) if m else "").lower()
     if not host:
         return False
     return host.endswith(RU_DOMAIN_TLD) or any(s in host for s in RU_DOMAIN_SUBSTR)
@@ -109,6 +117,26 @@ NEVER_POOL = {"adult", "radio"}
 
 _CATS_RE = {k: re.compile(v[2], re.I) for k, v in CATS.items()}
 
+# Исходный group-title из плейлиста (после склейки синонимов) -> тема. Надёжнее, чем regex по названию.
+# Правила для известных семейств каналов: без модели такие названия (Yosso TV Nature, Z!Horror HD ...)
+# иначе не понять. Проверяются по названию раньше общих regex. Ключи — темы из CATS.
+_FAM = r"^(?:yosso\s?tv|z!)\s*"
+_NAME_HINTS = [
+    (re.compile(_FAM + r"(?:music|rock|hits?)\b"), "music"),
+    (re.compile(_FAM + r"(?:nature|science|travel|history|discovery|animal)"), "docs"),
+    (re.compile(_FAM + r"disney|" + _FAM + r"kids"), "kids"),
+    (re.compile(_FAM + r"(?:drama|serial|sitcom)"), "series"),
+    (re.compile(_FAM + r"smile"), "entertain"),
+    (re.compile(_FAM + r"(?:action|adventure|thriller|horror|crime|detective|fantasy|military|comedy|family|"
+                r"channel|best|oblivion|adrenaline|vhs|sci-?fi)"), "movies"),
+    (re.compile(r"^top\s?budo"), "sport"),
+    (re.compile(r"^top\s?80"), "music"),
+    (re.compile(r"^top\s?cinema|^cineman|^\.?sci-?fi\b"), "movies"),
+]
+_GROUP_CAT = {"Музыка": "music", "Новости": "news", "Кино": "movies", "Дети": "kids", "Спорт": "sport",
+              "Документальные": "docs", "Путешествия": "docs", "Развлекательные": "entertain",
+              "Кухня": "docs", "Религия": "religion", "Для взрослых": "adult"}
+
 # Группы иностранных каналов по языку, который VL-модель определила по кадру (подсказка).
 LANG_GROUP = {
     "DE": "🇩🇪 Германия", "EN": "🇬🇧 Английские", "AR": "🌍 Арабские", "TR": "🇹🇷 Турецкие",
@@ -120,7 +148,7 @@ SHIFT_REGIONS = {
     -1: "Калининград", 1: "Самара", 2: "Екатеринбург", 3: "Омск", 4: "Красноярск и Новосибирск",
     5: "Иркутск", 6: "Якутск", 7: "Владивосток", 8: "Магадан", 9: "Камчатка",
 }
-_SHIFT_RE = re.compile(r"(?:(?<=\s)|(?<=\())([+\-−])\s?(\d{1,2})(?=\s|\)|$|ч\b|h\b)")
+_SHIFT_RE = re.compile(r"(?:(?<=\s)|(?<=\()|(?<=msk)|(?<=мск))([+\-−])\s?(\d{1,2})(?=\s|\)|$|ч\b|h\b)", re.I)
 
 _CYR = re.compile(r"[А-Яа-яЁё]")
 # буквы украинского, белорусского, казахского и т. п. алфавитов, которых нет в русском
@@ -131,12 +159,65 @@ _LATIN_EXT = re.compile(r"[\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff\u0100-\u017f]
 _NONRU_NAME = re.compile(
     r"deutsch|german|\bard\b|\bzdf\b|\brtl\b|sat\.?1|pro ?7\b|kabel ?eins|\borf\b|\bsrf\b|3sat|"
     r"tagesschau|super(?:rtl)?\b|sixx\b|tele[ -]?(5|berlin|club|de)\b|\bpuls\b|\bdaserste\b|"
-    r"servus ?tv|joyn\b|\bwdr\b|\bnr?[d]w?\b|\bn-tv\b|arte|\bsky\b|\bdhl\b|\bbundesliga\b|\bzero\b|"
+    r"servus ?tv|joyn\b|\bwdr\b|\b(?:ndr|mdr|swr|rbb)\b|\bn-tv\b|\barte\b|\bsky\b|\bdhl\b|\bbundesliga\b|\bzero\b|"
     # немецкие слова/топики в названиях и группах (с границами слов)
     r"\bhobby\b|\btier\b|\bheimatkino\b|\bvolksmusik\b|\bschlager\b|\bnachrichten\b|\bwetter\b|"
     r"\breportage\b|\bdoku(?:mentation)?\b|\bserien\b|\bfilme\b|"
+    r"\ba21 network\b|\b9x tashan\b|\b4fun\b|\bal emarat\b|\bal hadath\b|\babc spark\b", re.I)
+# Названия стран и языков. У канала с кириллицей в названии («Футбол. Англия», «Украина 24»)
+# это только слабый признак, у латинского названия — сильный.
+_COUNTRY_WORD = re.compile(
     r"qazaq|kazakh|kazakstan|казах|қазақ|немецк|германи|украин|ukrain|турецк|turk|"
-    r"польск|polish|англий|english|француз|french|итальянск|italian|испанск|spanish", re.I)
+    r"польск|polish|англий|english|француз|french|итальянск|italian|испанск|spanish|"
+    r"\bitaly\b|\bitalia\b|germany|deutschland|\bfrance\b|\bspain\b|espa[nñ]a|portugal|netherlands|nederland|holland|"
+    r"austria|[oö]sterreich|switzerland|schweiz|suisse|\bpoland\b|polska|greece|turkey|brazil|brasil|mexico|"
+    r"\bindia\b|japan|\bchina\b|korea|israel|bulgaria|romania|serbia|croatia|hungary|czech|slovak|sweden|norway|"
+    r"denmark|finland|britain|\b(?:usa|uk)\b", re.I)
+# Украина и Беларусь -> отдельная группа «СНГ» (страны и языки в названии/группе, буквы укр./бел. алфавита)
+_CIS_WORD = re.compile(
+    r"украин|україн|ukrain|беларус|белорус|білорус|belarus|казах|қазақ|kazakh|qazaq|"
+    r"молдов|moldov|армени|армян|armenia|азербайдж|azerbaij|узбекистан|uzbekistan|кыргыз|kyrgyz|таджик|tajik|туркмен|"
+    r"латви|latvia|литв|lithuania|lietuv|эстони|estonia|eesti", re.I)
+_CIS_LETTERS = re.compile(r"[ІіЇїЄєҐґЎўӘәҒғҚқҢңӨөҰұҮүҺһ]")   # укр., бел., каз. буквы
+_KZ_ONLY = re.compile(r"[ӘәҒғҚқҢңӨөҰұҮүҺһ]")
+# Зоны СНГ и Прибалтики: каналы не уходят в иностранные, а собираются в группу «СНГ»
+_CIS_TLD = {"ua", "by", "kz", "md", "am", "az", "uz", "kg", "tj", "tm", "ge", "lv", "lt", "ee"}
+_CIS_COUNTRY = _CIS_TLD | {"ukraine", "украина", "belarus", "беларусь", "kazakhstan", "казахстан", "moldova",
+                           "молдова", "armenia", "армения", "latvia", "lithuania", "estonia"}
+# Зоны чужих стран: по домену потока страна определяется однозначно (.com/.net/.tv и т. п. — нейтральны)
+FOREIGN_TLD = {"at", "de", "ch", "li", "nl", "be", "lu", "fr", "it", "es", "pt", "pl", "cz", "sk", "hu", "ro", "bg",
+               "rs", "hr", "si", "ba", "mk", "al", "me", "gr", "cy", "tr", "uk", "gb", "ie", "dk", "se", "no", "fi",
+               "is", "il", "ae", "sa", "eg", "ma", "dz", "tn", "lb", "iq", "ir", "in", "pk", "bd", "cn", "jp", "kr",
+               "tw", "hk", "th", "vn", "id", "my", "ph", "sg", "au", "nz", "za", "ng", "ke", "br", "mx", "ar", "cl",
+               "co", "pe", "ve", "uy", "us", "ca"}
+
+
+# Суффикс страны в конце названия «4Fun TV PL», «9X Tashan IN», «AMC CA», «Al Hadath AE» (заглавными, отдельным словом; далее может стоять HD).
+_NAME_CC = re.compile(r"(?<=\s)([A-Z]{2})(?:\s*\(?(?:HD|FHD|SD|4K)\)?)?\s*$")
+# неоднозначные коды (ID = Investigation Discovery, AM/FM и т. п.) исключены
+_NAME_CC_FOREIGN = FOREIGN_TLD - {"id", "is", "no", "me", "my", "co", "al", "li", "ng"}
+_NAME_CC_CIS = {"ua", "by", "kz", "md", "az", "uz", "kg", "tj", "lv", "lt", "ee"}
+
+
+def _name_cc(name):
+    m = _NAME_CC.search(name or "")
+    return m.group(1).lower() if m else ""
+
+
+def _host_tld(url):
+    """Доменная зона хоста из URL ('' для IP-адресов и хостов без точки)."""
+    try:
+        host = (urlsplit(url or "").hostname or "").lower()
+    except Exception:
+        host = ""
+    if not host:
+        m = re.match(r"\s*(?:[a-z][a-z0-9+.\-]*://)?(?:[^/@]*@)?([^/:?#\s]+)", url or "", re.I)
+        host = (m.group(1) if m else "").lower()
+    host = host.rstrip(".")
+    if "." not in host:
+        return ""
+    tld = host.rsplit(".", 1)[1]
+    return "" if tld.isdigit() else tld
 # чисто немецкие каналы, определяемые по точному совпадению имени (после нормализации)
 _DE_NAMES = {
     "das erste", "zdf", "zdfneo", "3sat", "kika", "phoenix", "rtl", "rtll", "rtl2", "rtlup",
@@ -148,7 +229,7 @@ _DE_NAMES = {
 # tvg-id с немецким/австрийским суффиксом без точки: zdf_de, orf_at ...
 _TVGID_UNDER_CC = re.compile(r"[_.-](de|at|ch)[_.-]?$")
 # суффикс страны в tvg-id (ZDF.de, Khabar.kz)
-_TVGID_CC = re.compile(r"\.(ru|de|at|ch|kz|ua|uk|gb|us|fr|it|es|tr|pl|pt|nl|be|az|am|ge|uz|lv|lt|ee|md|il|ae|sa|eg|in|cn|jp|kr|br|mx|ca|au)(?:@\w+)?$")
+_TVGID_CC = re.compile(r"\.(ru|de|at|ch|kz|ua|uk|gb|us|fr|it|es|tr|pl|pt|nl|be|az|am|ge|uz|lv|lt|ee|md|by|kg|tj|tm|il|ae|sa|eg|in|cn|jp|kr|br|mx|ca|au)(?:@\w+)?$")
 _RU_LATIN = re.compile(r"russia|rossiya|russian|match ?tv|ren ?tv|pyatnitsa|zvezda|karusel|domashniy|muz-?tv|"
                        r"mir ?24|perviy|pervyj|1 ?kanal", re.I)
 _FOREIGN_GROUP = re.compile(r"\b(germany|deutsch|german|france|french|italy|italia|spain|turk|usa|\buk\b|english|arab|"
@@ -214,7 +295,7 @@ class ExceptionList:
             self.words.append(w)
             if len(w) <= 3:
                 self._short.append((w.casefold(),
-                                    re.compile(r"(?<!\w)" + re.escape(w) + r"(?!\w)", re.I)))
+                                    re.compile(r"^\W*" + re.escape(w) + (r"(?!\w)" if (w[-1].isalnum() or w[-1] == "_") else ""), re.I)))
             else:
                 self._sub.append(w.casefold())
 
@@ -225,7 +306,8 @@ class ExceptionList:
         low = (name or "").strip().casefold()
         if any(w in low for w in self._sub):
             return True
-        return any(low.startswith(w) or rx.search(name or "") for w, rx in self._short)
+        # короткие слова (RT, TOP, FX...) — только в НАЧАЛЕ названия и целым словом: «RT Doc» да, «RTV»/«BBC Top Gear» нет
+        return any(rx.search(name or "") for w, rx in self._short)
 
 
 def load_exceptions(path):
@@ -243,18 +325,183 @@ def load_exceptions(path):
     return ExceptionList(words)
 
 
+class PriorityList:
+    """Слова из priority.md: каналы с таким именем стоят в группе первыми, в заданном порядке.
+    Совпадение: название (без HD/SD и скобок) равно слову или начинается с него + пробел."""
+
+    def __init__(self, words):
+        self.words = [w.strip().casefold() for w in words if w and w.strip()]
+
+    def __len__(self):
+        return len(self.words)
+
+    def rank(self, name):
+        n = _norm(name or "")
+        for i, w in enumerate(self.words):
+            if n == w or n.startswith(w + " "):
+                return i
+        return 10 ** 6
+
+
+def load_priority(path):
+    """Читает priority.md: названия через запятую или по одному на строку; строки с # — комментарии."""
+    try:
+        text = open(path, "r", encoding="utf-8-sig", errors="ignore").read()
+    except OSError:
+        return PriorityList([])
+    words = []
+    for line in text.splitlines():
+        if line.strip().startswith("#"):
+            continue
+        for part in re.split(r"[,;]", line):
+            w = part.strip().strip('"\'“”«»').strip()
+            if w:
+                words.append(w)
+    return PriorityList(words)
+
+
+_Q_RANK = [(re.compile(r"\b(4k|uhd)\b", re.I), 0),
+           (re.compile(r"\bfhd\b|\b1080p?\b", re.I), 1),
+           (re.compile(r"\bhd\b|\b720p?\b", re.I), 2),
+           (re.compile(r"\bsd\b|\b(?:480|360)p?\b", re.I), 4)]
+_Q_WORDS = re.compile(r"\b(hd|fhd|uhd|4k|sd|hevc|orig|оригинал|1080p?|720p?|480p?|360p?)\b", re.I)
+
+
+def _quality_rank(name):
+    """0 = 4K, 1 = FHD, 2 = HD, 3 = без пометки, 4 = SD (чем меньше, тем лучше)."""
+    for rx, r in _Q_RANK:
+        if rx.search(name or ""):
+            return r
+    return 3
+
+
+def _dedupe_key(name):
+    """Имя без пометок качества (скобки и +N остаются: это разные каналы)."""
+    return re.sub(r"\s+", " ", _Q_WORDS.sub("", (name or "").lower())).strip()
+
+
 class Organizer:
-    def __init__(self, llm=None, cb=None, stop=None, llm_workers=2, exceptions=None):
+    def __init__(self, llm=None, cb=None, stop=None, llm_workers=2, exceptions=None,
+                 priority=None, cache_path=None, skip_language=False, best_quality=False):
         self.exceptions = exceptions
+        self.priority = priority            # PriorityList из priority.md
+        self.skip_language = skip_language  # все каналы уже русскоязычные (язык не проверяется)
+        self.best_quality = best_quality    # у одинаковых каналов оставлять только лучшее качество
+        self.cache_path = cache_path
+        self.cache = self._load_cache(cache_path) if cache_path else None
         self.llm = llm
         self.cb = cb
         self.stop = stop
         self.workers = max(1, int(llm_workers))
         self.llm_ok = llm is not None
         self.stats = {"exceptions": 0, "ru": 0, "foreign": 0, "shifted": 0, "ru_groups": 0, "foreign_groups": 0,
-                      "llm_calls": 0, "llm_errors": 0, "llm_lang": 0, "llm_cat": 0}
+                      "llm_calls": 0, "llm_errors": 0, "llm_lang": 0, "llm_cat": 0,
+                      "dedup": 0, "by_domain": 0, "cis": 0}
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _load_cache(path):
+        """Кэш решений (язык, тема, названия групп): повторные запуски быстрее и одинаковее."""
+        data = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        for k in ("lang", "cat", "titles"):
+            if not isinstance(data.get(k), dict):
+                data[k] = {}
+        return data
+
+    def _save_cache(self):
+        if self.cache is None or not self.cache_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.cache_path)), exist_ok=True)
+            with open(self.cache_path, "w", encoding="utf-8") as f:
+                json.dump(self.cache, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _ck(e):
+        """Ключ кэша: нормализованное имя + группа."""
+        return _norm(e["name"]) + "|" + (e.get("group") or "").strip().lower()
+
+    def _sort_items(self, items, themed=False):
+        """Порядок внутри группы: [тема — только в группах со сдвигом времени], приоритет из priority.md,
+        имя, качество (лучшее первым: 4K, FHD, HD, без пометки, SD)."""
+        def key(e):
+            pr = self.priority.rank(e["name"]) if self.priority else 10 ** 6
+            th = e.get("theme") or "other"
+            th_i = OUT_ORDER.index(th) if (themed and th in OUT_ORDER) else 0
+            return (th_i, pr, _norm(e["name"]), _quality_rank(e["name"]), e["name"])
+        return sorted(items, key=key)
+
+    def _best_quality(self, items):
+        """У одинаковых каналов (отличаются только HD/SD/FHD) оставляет первый = лучший."""
+        seen = set()
+        out = []
+        for e in items:
+            k = _dedupe_key(e["name"])
+            if k in seen:
+                self.stats["dedup"] += 1
+                continue
+            seen.add(k)
+            out.append(e)
+        return out
+
+    @staticmethod
+    def _range_label(part):
+        """«А–К» — первая буква первого и последнего канала части (для навигации между частями одной темы)."""
+        def first(e):
+            m = re.search(r"\w", _norm(e["name"]))
+            return m.group(0).upper() if m else ""
+        a, b = first(part[0]), first(part[-1])
+        if not a or not b:
+            return ""
+        return a if a == b else f"{a}–{b}"
+
+    def _report_lines(self, ru_groups, foreign_groups):
+        """Отчёт «почему канал здесь»: группа | канал | язык (причина) | тема (причина)."""
+        lines = ["группа | канал | язык (почему) | тема (почему)\n"]
+        for tag, groups in (("RU", ru_groups), ("FOREIGN", foreign_groups)):
+            for gname, part in groups:
+                for e in part:
+                    lang = e.get("lang_why") or f"правила (score {e.get('score', '?')})"
+                    lines.append(f"{gname} | {e['name']} | {tag}: {lang} | "
+                                 f"{e.get('cat', '-')}: {e.get('cat_why') or '-'}\n")
+        return lines
+
+    @staticmethod
+    def _foreign_evidence(e):
+        """Жёсткий признак чужой страны: домен чужой страны в URL или страна/немецкое имя в названии
+        без кириллицы. Такой признак важнее слов из except.md (иначе «RTV» из .at считался бы русским)."""
+        name = e.get("name") or ""
+        if _CYR.search(name) or Organizer._is_cis(e):
+            return False
+        if _host_tld(e.get("url")) in FOREIGN_TLD or _name_cc(name) in _NAME_CC_FOREIGN:
+            return True
+        return bool(_NONRU_NAME.search(name) or _COUNTRY_WORD.search(name))
+
+    @staticmethod
+    def _is_cis(e):
+        """Канал из Украины или Беларуси: слово в названии/группе, буквы укр./бел. алфавита,
+        tvg-id .ua/.by или tvg-country UA/BY. Казахские буквы в названии — не СНГ в этом смысле."""
+        name = e.get("name") or ""
+        group = e.get("group") or ""
+        attrs = e.get("attrs") or {}
+        if _CIS_LETTERS.search(name) or _CIS_WORD.search(name) or (group and _CIS_WORD.search(group)):
+            return True
+        m = _TVGID_CC.search((attrs.get("tvg-id") or "").lower().strip())
+        if m and m.group(1) in _CIS_TLD:
+            return True
+        if _host_tld(e.get("url")) in _CIS_TLD or _name_cc(name) in _NAME_CC_CIS:
+            return True
+        return (attrs.get("tvg-country") or "").lower().strip() in _CIS_COUNTRY
+
     def _p(self, frac, desc, line=None):
         if self.cb:
             self.cb(frac, desc, line)
@@ -313,6 +560,10 @@ class Organizer:
             return 3
         name, group, attrs = e["name"], e["group"], e["attrs"]
         score = 0
+        if _name_cc(name) in _NAME_CC_FOREIGN and not _CYR.search(name):
+            return -4   # «...  PL / IN / CA / AE / US» — суффикс чужой страны в названии
+        if _host_tld(e.get("url")) in FOREIGN_TLD:
+            score -= 3   # домен чужой страны (.at .nl .it .de ...)
         if _UKR.search(name) or _LATIN_EXT.search(name):
             return -4
         # явные метаданные языка/страны считаем ДО проверки названия/группы:
@@ -324,10 +575,15 @@ class Organizer:
         id_is_ru = bool(m and m.group(1) == "ru")
         explicit_ru_meta = has_ru_lang or id_is_ru
         has_cyr_name = bool(_CYR.search(name))
-        if _NONRU_NAME.search(name) or (group and _NONRU_NAME.search(group)):
+        name_strong = bool(_NONRU_NAME.search(name))
+        name_country = bool(_COUNTRY_WORD.search(name))
+        group_hit = bool(group and (_NONRU_NAME.search(group) or _COUNTRY_WORD.search(group)))
+        if name_strong or name_country or group_hit:
             # немецкий топик только в группе — слабый признак: не перебивает
             # кириллическое название или явные русские метаданные
-            if group and not _NONRU_NAME.search(name) and (has_cyr_name or explicit_ru_meta):
+            # жёсткий признак: немецкое имя или страна в латинском названии
+            hard = name_strong or (name_country and not has_cyr_name)
+            if not hard and (has_cyr_name or explicit_ru_meta):
                 score -= 1
                 if has_cyr_name:
                     score += 2   # кириллическое имя перевешивает немецкий топик группы
@@ -372,10 +628,18 @@ class Organizer:
         undecided = []
         weak = []
         for e in entries:
-            if self.exceptions and self.exceptions.match(e["name"]):
+            if self.exceptions and self.exceptions.match(e["name"]) and not self._foreign_evidence(e):
                 e["ru"] = True          # слово из except.md: всегда русскоязычный
                 e["score"] = 9
+                e["lang_why"] = "слово из except.md"
                 self.stats["exceptions"] += 1
+                continue
+            if url_looks_russian(e.get("url")):
+                # домен .ru / .black / .red / klaipedalt / akciatv: всегда русскоязычный, модель не пересматривает
+                e["ru"] = True
+                e["score"] = 9
+                e["lang_why"] = "домен в URL"
+                self.stats["by_domain"] += 1
                 continue
             s = self._lang_score(e)
             e["score"] = s
@@ -394,6 +658,16 @@ class Organizer:
                 e["ru"] = None
                 undecided.append(e)
         check = undecided + weak
+        if check and self.cache is not None:
+            left = []
+            for e in check:
+                hit = self.cache["lang"].get(self._ck(e))
+                if hit is None:
+                    left.append(e)
+                elif e["ru"] is None or hit is False:
+                    e["ru"] = hit
+                    e["lang_why"] = "кэш"
+            check = left
         if check and self.llm_ok:
             items = [(id(e), f"{e['name']} | group: {e['group'] or '-'}") for e in check]
 
@@ -432,7 +706,10 @@ class Organizer:
 
             res = self._batches(items, make_prompt, parse, BATCH * 7, 0.0, 0.2, "Язык (модель)")
             for e in check:
+                if id(e) in res and self.cache is not None:
+                    self.cache["lang"][self._ck(e)] = res[id(e)]
                 if id(e) in res and (e["ru"] is None or res[id(e)] is False):
+                    e["lang_why"] = "модель"
                     e["ru"] = res[id(e)]
                     self.stats["llm_lang"] += 1
         for e in entries:
@@ -444,6 +721,30 @@ class Organizer:
     # ------------------------------------------------------------------
     @staticmethod
     def _rule_category(e):
+        """Тема по правилам: 18+/радио — всегда первыми; дальше совпадения regex по названию+группе;
+        если совпало несколько — побеждает тема из исходного group-title; без совпадений — тема группы."""
+        name_l = (e["name"] or "").lower().strip()
+        group = e.get("group") or ""
+        text = f"{name_l} {group}".lower()
+        for key in ("adult", "radio"):
+            if _CATS_RE[key].search(text):
+                return key
+        for rx, hcat in _NAME_HINTS:
+            if rx.search(name_l):
+                return hcat
+        gcat = _GROUP_CAT.get(canonical_group(group)) if group else None
+        hits = [k for k in RULE_ORDER
+                if k not in ("adult", "radio", "federal") and _CATS_RE[k].search(text)]
+        if gcat in hits:
+            return gcat
+        if hits:
+            return hits[0]
+        if _CATS_RE["federal"].search(name_l):
+            return "federal"
+        return gcat
+
+    @staticmethod
+    def _rule_category_old(e):
         text = f"{e['name']} {e['group']}".lower()
         for key in RULE_ORDER:
             rx = _CATS_RE[key]
@@ -465,14 +766,28 @@ class Organizer:
                     m = n
             if m is not None:
                 e["cat"] = "shift"
+                e["cat_why"] = "сдвиг времени"
+                e["theme"] = self._rule_category(e) or "other"
                 e["shift"] = m
                 self.stats["shifted"] += 1
                 continue
             cat = self._rule_category(e)
             e["cat"] = cat
+            if cat:
+                e["cat_why"] = "правило"
             if cat is None:
                 pending.append(e)
 
+        if pending and self.cache is not None:
+            left = []
+            for e in pending:
+                hit = self.cache["cat"].get(self._ck(e))
+                if hit in CATS:
+                    e["cat"] = hit
+                    e["cat_why"] = "кэш"
+                else:
+                    left.append(e)
+            pending = left
         if pending and self.llm_ok:
             items = [(id(e), f"{e['name']} | group: {e['group'] or '-'}") for e in pending]
             cats_text = "\n".join(f"{i}={CATS[k][1]}" for i, k in enumerate(LLM_CATS, 1))
@@ -496,6 +811,9 @@ class Organizer:
             for e in pending:
                 if id(e) in res:
                     e["cat"] = res[id(e)]
+                    e["cat_why"] = "модель"
+                    if self.cache is not None:
+                        self.cache["cat"][self._ck(e)] = res[id(e)]
                     self.stats["llm_cat"] += 1
         for e in ru_entries:
             if e["cat"] is None:
@@ -505,6 +823,12 @@ class Organizer:
     # Названия групп
     # ------------------------------------------------------------------
     def _creative_title(self, cat, names, idx, used):
+        ck = f"{cat}|{idx}"
+        if self.cache is not None:
+            cached = self.cache["titles"].get(ck)
+            if cached and cached.lower() not in used:
+                used.add(cached.lower())
+                return cached     # названия групп не меняются между запусками
         title = None
         if self.llm_ok and not self._stopped():
             sample = ", ".join(_norm(n) for n in names[:12])
@@ -522,6 +846,8 @@ class Organizer:
             else:
                 title = f"{pool[idx % len(pool)]} · {idx // len(pool) + 1}"
         used.add(title.lower())
+        if self.cache is not None:
+            self.cache["titles"][ck] = title
         return title
 
     # ------------------------------------------------------------------
@@ -571,11 +897,30 @@ class Organizer:
                     "ru_groups": [], "foreign_groups": []}
 
         self._p(0.0, "Сортировка: язык", f"🗂 Сортировка: каналов {len(entries)}")
-        self._detect_language(entries)
+        if self.skip_language:
+            for e in entries:
+                e["ru"] = True
+                e["score"] = 9
+                if self.exceptions and self.exceptions.match(e["name"]) and not self._foreign_evidence(e):
+                    e["lang_why"] = "слово из except.md"
+                elif url_looks_russian(e.get("url")):
+                    e["lang_why"] = "домен в URL"
+                else:
+                    e["lang_why"] = "язык не проверялся"
+        else:
+            self._detect_language(entries)
         if self._stopped():
             return None
-        ru = [e for e in entries if e["ru"]]
-        foreign = [e for e in entries if not e["ru"]]
+        # Украина и Беларусь — отдельная группа «СНГ» (внутри русского файла); слова из except.md и домены .ru это не меняют
+        cis = []
+        for e in entries:
+            if e.get("lang_why") not in ("слово из except.md", "домен в URL") and self._is_cis(e):
+                e["cis"] = True
+                e["cat"] = "cis"
+                e["cat_why"] = "Украина/Беларусь"
+                cis.append(e)
+        ru = [e for e in entries if e["ru"] and not e.get("cis")]
+        foreign = [e for e in entries if not e["ru"] and not e.get("cis")]
         self.stats["ru"], self.stats["foreign"] = len(ru), len(foreign)
         self._p(0.2, "Сортировка: темы", f"🇷🇺 Русскоязычных: {len(ru)}, остальных: {len(foreign)}")
 
@@ -590,10 +935,10 @@ class Organizer:
             buckets.setdefault(key, []).append(e)
 
         # мелкие темы -> «Разное»
-        for key in list(buckets):
+        for key in sorted(buckets, key=lambda k: len(buckets[k])):
             cat, _ = key
-            if cat not in NEVER_POOL and cat not in ("shift", "other") and len(buckets[key]) < MIN_GROUP:
-                buckets.setdefault(("other", None), []).extend(buckets.pop(key))
+            if cat not in NEVER_POOL and cat not in ("shift", "other", "federal") and len(buckets[key]) < MIN_GROUP:
+                buckets.setdefault((MERGE_TO.get(cat, "other"), None), []).extend(buckets.pop(key))
 
         def order_key(key):
             cat, shift = key
@@ -608,7 +953,10 @@ class Organizer:
             if self._stopped():
                 return None
             cat, shift = key
-            items = sorted(buckets[key], key=lambda e: (_norm(e["name"]), e["name"]))
+            items = self._sort_items(buckets[key], themed=(cat == "shift"))
+            if self.best_quality:
+                items = self._best_quality(items)
+            multi = len(_chunk_sizes(len(items))) > 1
             pos = 0
             for idx, size in enumerate(_chunk_sizes(len(items))):
                 part = items[pos:pos + size]
@@ -621,11 +969,25 @@ class Organizer:
                     gname = f"{RU_FLAG} 🕓 {title}"
                 else:
                     title = self._creative_title(cat, [e["name"] for e in part], idx, used)
-                    gname = f"{RU_FLAG} {CATS[cat][0]} {title}"
+                    rng = self._range_label(part) if multi else ""
+                    gname = f"{RU_FLAG} {CATS[cat][0]} {title}" + (f" · {rng}" if rng else "")
                 ru_groups.append((gname, part))
                 made += 1
                 self._p(0.5 + 0.4 * made / total_chunks, f"Названия групп: {made}/{total_chunks}",
                         f"   {gname} — {len(part)} кан.")
+
+        # ---------- СНГ: Украина и Беларусь (СНГ, СНГ 2, СНГ 3 ... по ≤ 50 каналов) ----------
+        if cis:
+            cis_items = self._sort_items(cis)
+            if self.best_quality:
+                cis_items = self._best_quality(cis_items)
+            self.stats["cis"] = len(cis_items)
+            pos = 0
+            for idx, size in enumerate(_chunk_sizes(len(cis_items))):
+                part = cis_items[pos:pos + size]
+                pos += size
+                ru_groups.append(("🌐 СНГ" + (f" {idx + 1}" if idx else ""), part))
+            self._p(0.92, "СНГ", f"🌐 Украина/Беларусь в группе «СНГ»: {len(cis_items)}")
 
         # ---------- нерусские ----------
         fb = {}
@@ -651,26 +1013,28 @@ class Organizer:
                 pool.extend(fb.pop(g))
         foreign_groups = []
         for g in sorted(fb, key=lambda x: x.lower()):
-            items = sorted(fb[g], key=lambda e: (_norm(e["name"]), e["name"]))
+            items = self._sort_items(fb[g])
             pos = 0
             for idx, size in enumerate(_chunk_sizes(len(items))):
                 part = items[pos:pos + size]
                 pos += size
                 foreign_groups.append((f"{WORLD} {g}" + (f" · {idx + 1}" if idx else ""), part))
         if pool:
-            pool.sort(key=lambda e: (_norm(e["name"]), e["name"]))
+            pool = self._sort_items(pool)
             pos = 0
             for idx, size in enumerate(_chunk_sizes(len(pool))):
                 part = pool[pos:pos + size]
                 pos += size
                 foreign_groups.append((f"{WORLD} Разное иностранное" + (f" · {idx + 1}" if idx else ""), part))
 
+        self._save_cache()
         self.stats["ru_groups"] = len(ru_groups)
         self.stats["foreign_groups"] = len(foreign_groups)
         self._p(0.95, "Сортировка: сборка файлов",
                 f"🌍 Нерусскоязычных групп: {len(foreign_groups)}")
 
         return {
+            "report_lines": self._report_lines(ru_groups, foreign_groups),
             "ru_lines": self._to_lines(ru_groups),
             "foreign_lines": self._to_lines(foreign_groups),
             "stats": self.stats,
