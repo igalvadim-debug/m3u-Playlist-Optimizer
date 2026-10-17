@@ -197,6 +197,7 @@ def cleaner_function(files, blocklist_text, epg_choice=None, epg_custom="", catc
     
     progress_log = []
     def log_progress(msg):
+        """Сохраняет сообщение прогресса в список."""
         progress_log.append(msg)
     
     file_paths = [f.name for f in files]
@@ -236,6 +237,7 @@ def tester_function(files, timeout, workers, epg_choice=None, epg_custom="", cat
 
     progress_log = []
     def log_progress(msg):
+        """Сохраняет сообщение прогресса в список."""
         progress_log.append(msg)
 
     file_paths = [f.name for f in files]
@@ -415,9 +417,11 @@ def run_pipeline(files, epg_choice, epg_custom, catchup=True, do_test=False, tim
     holder = {}
 
     def cb(frac, desc, line=None):
+        """Кладёт событие прогресса (доля выполнения, описание, строка лога) в очередь."""
         events.put(("p", frac, desc, line))
 
     def worker():
+        """Фоновый поток: выполняет конвейер фильтрации и кладёт результат в очередь событий."""
         try:
             verified_folder = create_verified_folder()
             streams, chunks = _load_streams_chunked(file_paths, verified_folder, cb)
@@ -539,6 +543,7 @@ def epg_function(files, sources_choice=None, sources_custom="", epg_choice=None,
 
     progress_log = []
     def log_progress(msg):
+        """Сохраняет сообщение прогресса в список."""
         progress_log.append(msg)
 
     xml, name2id = builder.build([f.name for f in files], sources, log_progress)
@@ -585,6 +590,7 @@ def converter_function(files):
     
     progress_log = []
     def log_progress(msg):
+        """Сохраняет сообщение прогресса в список."""
         progress_log.append(msg)
     
     file_paths = [f.name for f in files]
@@ -734,6 +740,7 @@ def _run_sort(filt, streams, cb, stop_event, llm_workers):
 
 
 def _groups_text(groups, limit=60):
+    """Текстовое представление списка групп с количеством каналов (с ограничением числа строк)."""
     rows = [f"  • {g} — {n}" for g, n in groups[:limit]]
     if len(groups) > limit:
         rows.append(f"  … ещё групп: {len(groups) - limit}")
@@ -756,9 +763,11 @@ def llm_filter_function(files, timeout, ffmpeg_workers, llm_workers, frames, rem
     holder = {}
 
     def cb(frac, desc, line=None):
+        """Кладёт событие прогресса (доля выполнения, описание, строка лога) в очередь."""
         events.put(("p", frac, desc, line))
 
     def worker():
+        """Фоновый поток: выполняет FFmpeg-отсев, проверку кадров и сортировку, кладёт результат в очередь событий."""
         filt = None
         try:
             filt = LLMFilter(
