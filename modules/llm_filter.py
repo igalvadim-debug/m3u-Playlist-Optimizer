@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 from modules.tester import M3UTester
-from modules.organizer import ADULT_RE
+from modules.organizer import ADULT_RE, is_adult_host
 
 logger = logging.getLogger("m3ugenius.llm_filter")
 
@@ -408,10 +408,15 @@ class LLMFilter:
 
         # ---- Жёсткое правило 18+ по названию (если включено; язык не важен) ----
         if self.separate_adult:
-            adult = [(s, "18+ (имя)") for s in streams if ADULT_RE.search(self.channel_name(s["info"]))]
+            # хост из adult_hosts.md (напр. video2.tizam.cc) — 18+ сразу, без проверки потока и кадра
+            def _by_host(s):
+                return is_adult_host(s.get("url"))
+            adult = [(s, "18+ (домен)" if _by_host(s) else "18+ (имя)") for s in streams
+                     if _by_host(s) or ADULT_RE.search(self.channel_name(s["info"]))]
             if adult:
                 stats["adult"] += len(adult)
-                streams = [s for s in streams if not ADULT_RE.search(self.channel_name(s["info"]))]
+                adult_ids = {id(s) for s, _ in adult}
+                streams = [s for s in streams if id(s) not in adult_ids]
                 self._emit(0.0, "18+ по названию",
                            f"🔞 Вынесено 18+ по названию: {len(adult)}")
         if not streams:

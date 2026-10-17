@@ -23,7 +23,8 @@ from modules.header import (DEFAULT_EPG, apply_header, EPG_CHOICES, EPG_SOURCES,
                            CATCHUP_LABELS, CATCHUP_DEFAULT, archive_params, catchup_mode_of)
 from modules.m3u_utils import (parse_m3u, url_key, set_group, split_extinf, canonical_group,
                                merge_group_synonyms)
-from modules.organizer import Organizer, load_exceptions, load_priority
+from modules.organizer import (Organizer, load_exceptions, load_priority, set_adult_hosts_file,
+                               is_adult_host, load_databank, url_looks_russian, _norm as org_norm)
 from modules import logos
 
 
@@ -37,6 +38,11 @@ FONT_PATH = Path("ttf/DejaVuSans.ttf")
 _OUT_ABS = OUTPUT_DIR if OUTPUT_DIR.is_absolute() else Path(__file__).resolve().parent / OUTPUT_DIR
 PRIORITY_FILE = _OUT_ABS / "priority.md"
 SORT_CACHE_FILE = _OUT_ABS / "sort_cache.json"
+ADULT_HOSTS_FILE = _OUT_ABS / "adult_hosts.md"    # хосты, потоки с которых сразу уходят в 18+
+DATABANK_FILE = _OUT_ABS / "databank.json"       # датабанк каналов (язык/тема)
+DEFAULT_ADULT_HOSTS = ("# Хосты, потоки с которых сразу отправляются в 18+ (без проверки названия и кадра).\n"
+                       "# По одному на строку или через запятую; можно с http://, берётся только хост. Поддомены тоже считаются.\n"
+                       "video2.tizam.cc\n")
 DEFAULT_PRIORITY = ("# Порядок каналов внутри группы: эти каналы стоят первыми, в заданном порядке.\n"
                     "# Названия через запятую или по одному на строку. Строки с # — комментарии. HD/SD в названии не важны.\n"
                     "Первый канал, Россия 1, Матч ТВ, НТВ, Пятница, Звезда, ТВ Центр, РЕН ТВ, СТС, Домашний, "
@@ -85,6 +91,33 @@ def _load_exceptions():
         _exceptions_cache["obj"] = load_exceptions(EXCEPT_FILE)
         _exceptions_cache["mtime"] = mtime
     return _exceptions_cache["obj"]
+
+
+def _init_adult_hosts():
+    """Создаёт adult_hosts.md (с video2.tizam.cc) при первом запуске и подключает его к сортировке."""
+    try:
+        if not ADULT_HOSTS_FILE.exists():
+            ADULT_HOSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            ADULT_HOSTS_FILE.write_text(DEFAULT_ADULT_HOSTS, encoding="utf-8")
+    except OSError:
+        pass
+    set_adult_hosts_file(ADULT_HOSTS_FILE)
+
+
+_init_adult_hosts()
+_databank_cache = {"mtime": None, "obj": {}}
+
+
+def _load_databank():
+    """Датабанк каналов из outputs/databank.json (перечитывается только при изменении)."""
+    try:
+        mtime = DATABANK_FILE.stat().st_mtime
+    except OSError:
+        return {}
+    if _databank_cache["mtime"] != mtime:
+        _databank_cache["obj"] = load_databank(DATABANK_FILE)
+        _databank_cache["mtime"] = mtime
+    return _databank_cache["obj"]
 
 
 _priority_cache = {"mtime": None, "obj": None}
@@ -437,6 +470,13 @@ def _split_foreign_keep(streams, exceptions=None):
             e["group"] = (attrs.get("group-title") or "").strip()
         except Exception:
             pass
+        if is_adult_host(e.get("url")):
+            ru.append(s)   # 18+-хост: язык не важен, дальше его заберёт _split_adult
+            continue
+        rec = _load_databank().get(org_norm(e["name"]))
+        if rec and rec.get("lang") in ("ru", "cis", "foreign") and not url_looks_russian(e.get("url")):
+            (foreign if rec["lang"] == "foreign" else ru).append(s)   # датабанк важнее правил
+            continue
         if exceptions and exceptions.match(e["name"]) and not Organizer._foreign_evidence(e):
             ru.append(s)
             kept_by_exc += 1
@@ -454,13 +494,13 @@ def _split_foreign_keep(streams, exceptions=None):
 def _split_adult(streams):
     """18+ по названию — в отдельный список (язык канала не важен). -> (adult, rest)."""
     from modules.organizer import ADULT_RE
-    adult, rest = [], []
+    adult, rest = [], []   # хост из adult_hosts.md — 18+ сразу, не глядя
     for s in streams:
         try:
             _, _, name = split_extinf(s["info"])
         except Exception:
             name = ""
-        (adult if ADULT_RE.search(name or "") else rest).append(s)
+        (adult if (is_adult_host(s.get("url")) or ADULT_RE.search(name or "")) else rest).append(s)
     return adult, rest
 
 
@@ -499,7 +539,7 @@ def _group_by_topics(streams):
     """Группировка по темам — та же логика, что и в вкладке LLM-Filter (Organizer без модели, язык не перепроверяется):
     сдвиги времени, группы по ≤ 50, приоритеты, качество, кэш названий. Возвращает (строки, сводка)."""
     org = Organizer(llm=None, exceptions=_load_exceptions(), priority=_load_priority(),
-                    cache_path=SORT_CACHE_FILE, skip_language=True)
+                    cache_path=SORT_CACHE_FILE, skip_language=True, databank=_load_databank())
     res = org.organize(streams)
     return res["ru_lines"], res["ru_groups"]
 
@@ -930,7 +970,8 @@ def _run_sort(filt, streams, cb, stop_event, llm_workers, best_quality=False):
     except Exception as e:
         cb(0.0, "Сортировка без модели", f"⚠️ Модель недоступна ({e}). Сортирую только по правилам")
     org = Organizer(llm=llm, cb=cb, stop=stop_event, llm_workers=llm_workers, exceptions=_load_exceptions(),
-                    priority=_load_priority(), cache_path=SORT_CACHE_FILE, best_quality=best_quality)
+                    priority=_load_priority(), cache_path=SORT_CACHE_FILE, best_quality=best_quality,
+                    databank=_load_databank())
     return org.organize(streams)
 
 

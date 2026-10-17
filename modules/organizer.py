@@ -11,6 +11,7 @@
 import json
 import math
 import os
+import time
 import re
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -325,6 +326,75 @@ def load_exceptions(path):
     return ExceptionList(words)
 
 
+# ---- Хосты, поток с которых сразу считается 18+ (outputs/adult_hosts.md), без проверки названия и кадра ----
+_ADULT = {"path": None, "mtime": None, "checked": 0.0, "hosts": ["video2.tizam.cc"]}
+
+
+def _norm_host(h):
+    """'http://user@Video2.Tizam.cc:80/x' -> 'video2.tizam.cc'."""
+    h = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", (h or "").strip().lower())
+    h = h.split("/", 1)[0].rsplit("@", 1)[-1]
+    return re.split(r"[:?#\s]", h, 1)[0].strip(".")
+
+
+def set_adult_hosts_file(path):
+    """Файл со списком 18+-хостов; перечитывается автоматически, когда его меняют."""
+    _ADULT["path"], _ADULT["mtime"], _ADULT["checked"] = str(path), None, 0.0
+
+
+def _refresh_adult_hosts():
+    p = _ADULT["path"]
+    if not p or time.time() - _ADULT["checked"] < 1.0:
+        return
+    _ADULT["checked"] = time.time()
+    try:
+        mt = os.path.getmtime(p)
+        if mt == _ADULT["mtime"]:
+            return
+        text = open(p, "r", encoding="utf-8-sig", errors="ignore").read()
+    except OSError:
+        return
+    hosts = []
+    for line in text.splitlines():
+        if line.strip().startswith("#"):
+            continue
+        for part in re.split(r"[,;\s]+", line):
+            h = _norm_host(part)
+            if h:
+                hosts.append(h)
+    _ADULT["hosts"], _ADULT["mtime"] = hosts, mt
+
+
+def is_adult_host(url):
+    """True, если хост потока есть в adult_hosts.md (сам домен или его поддомен)."""
+    _refresh_adult_hosts()
+    if not _ADULT["hosts"] or not url:
+        return False
+    host = _norm_host(url)
+    return any(host == h or host.endswith("." + h) for h in _ADULT["hosts"])
+
+
+def load_databank(path):
+    """Датабанк каналов (outputs/databank.json):
+    {"channels": {"название": {"lang": "ru|foreign|cis", "cat": "movies"}}}.
+    Ключи нормализуются как имена при сортировке (без HD/SD и скобок). Запись в датабанке важнее
+    слов из except.md и правил, но не важнее домена .ru/klaipedalt/akciatv и 18+-хостов."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    chans = data.get("channels", data) if isinstance(data, dict) else {}
+    out = {}
+    for k, v in chans.items():
+        if not isinstance(v, dict) or str(k).startswith("_"):
+            continue
+        key = _norm(str(k))
+        if key:
+            out[key] = v
+    return out
+
+
 class PriorityList:
     """Слова из priority.md: каналы с таким именем стоят в группе первыми, в заданном порядке.
     Совпадение: название (без HD/SD и скобок) равно слову или начинается с него + пробел."""
@@ -382,12 +452,14 @@ def _dedupe_key(name):
 
 class Organizer:
     def __init__(self, llm=None, cb=None, stop=None, llm_workers=2, exceptions=None,
-                 priority=None, cache_path=None, skip_language=False, best_quality=False):
+                 priority=None, cache_path=None, skip_language=False, best_quality=False,
+                 databank=None):
         self.exceptions = exceptions
         self.priority = priority            # PriorityList из priority.md
         self.skip_language = skip_language  # все каналы уже русскоязычные (язык не проверяется)
         self.best_quality = best_quality    # у одинаковых каналов оставлять только лучшее качество
         self.cache_path = cache_path
+        self.databank = databank or {}      # датабанк: {норм. имя: {"lang":..., "cat":...}}
         self.cache = self._load_cache(cache_path) if cache_path else None
         self.llm = llm
         self.cb = cb
@@ -396,7 +468,7 @@ class Organizer:
         self.llm_ok = llm is not None
         self.stats = {"exceptions": 0, "ru": 0, "foreign": 0, "shifted": 0, "ru_groups": 0, "foreign_groups": 0,
                       "llm_calls": 0, "llm_errors": 0, "llm_lang": 0, "llm_cat": 0,
-                      "dedup": 0, "by_domain": 0, "cis": 0}
+                      "dedup": 0, "by_domain": 0, "cis": 0, "databank": 0}
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -429,6 +501,9 @@ class Organizer:
     def _ck(e):
         """Ключ кэша: нормализованное имя + группа."""
         return _norm(e["name"]) + "|" + (e.get("group") or "").strip().lower()
+
+    def _db_rec(self, e):
+        return self.databank.get(_norm(e["name"])) if self.databank else None
 
     def _sort_items(self, items, themed=False):
         """Порядок внутри группы: [тема — только в группах со сдвигом времени], приоритет из priority.md,
@@ -628,6 +703,19 @@ class Organizer:
         undecided = []
         weak = []
         for e in entries:
+            if is_adult_host(e.get("url")):
+                e["ru"] = True          # 18+-хост: язык не важен, канал пойдёт в «Для взрослых»
+                e["score"] = 9
+                e["lang_why"] = "хост 18+"
+                continue
+            rec = self._db_rec(e)
+            if rec and rec.get("lang") in ("ru", "foreign", "cis") and not url_looks_russian(e.get("url")):
+                e["db_lang"] = rec["lang"]
+                e["ru"] = rec["lang"] in ("ru", "cis")
+                e["score"] = 9 if e["ru"] else -9
+                e["lang_why"] = "датабанк"
+                self.stats["databank"] += 1
+                continue
             if self.exceptions and self.exceptions.match(e["name"]) and not self._foreign_evidence(e):
                 e["ru"] = True          # слово из except.md: всегда русскоязычный
                 e["score"] = 9
@@ -726,6 +814,8 @@ class Organizer:
         name_l = (e["name"] or "").lower().strip()
         group = e.get("group") or ""
         text = f"{name_l} {group}".lower()
+        if is_adult_host(e.get("url")):
+            return "adult"
         for key in ("adult", "radio"):
             if _CATS_RE[key].search(text):
                 return key
@@ -770,6 +860,15 @@ class Organizer:
                 e["theme"] = self._rule_category(e) or "other"
                 e["shift"] = m
                 self.stats["shifted"] += 1
+                continue
+            if is_adult_host(e.get("url")):
+                e["cat"] = "adult"
+                e["cat_why"] = "хост 18+"
+                continue
+            rec = self._db_rec(e)
+            if rec and rec.get("cat") in CATS and rec["cat"] != "shift":
+                e["cat"] = rec["cat"]
+                e["cat_why"] = "датабанк"
                 continue
             cat = self._rule_category(e)
             e["cat"] = cat
@@ -914,7 +1013,8 @@ class Organizer:
         # Украина и Беларусь — отдельная группа «СНГ» (внутри русского файла); слова из except.md и домены .ru это не меняют
         cis = []
         for e in entries:
-            if e.get("lang_why") not in ("слово из except.md", "домен в URL") and self._is_cis(e):
+            if e.get("lang_why") not in ("слово из except.md", "домен в URL", "хост 18+") \
+                    and (e.get("db_lang") == "cis" or (e.get("db_lang") is None and self._is_cis(e))):
                 e["cis"] = True
                 e["cat"] = "cis"
                 e["cat_why"] = "Украина/Беларусь"
